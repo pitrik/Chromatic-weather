@@ -1,6 +1,7 @@
 {
   "manifest_version": 1,
   "name": "Chromatic Weather",
+  "homepage_url": "https://github.com/pitrik/Chromatic-weather",
   "description": "Add colourful atmospheric particle effects — embers, bloom, fireflies, snow, rain, and more — with full colour customization.",
   "author": "Pitrik",
   "version": "1.0.0",
