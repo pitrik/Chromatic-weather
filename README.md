@@ -1,3 +1,4 @@
+# Chromatic Weather
 
 An [Owlbear Rodeo](https://www.owlbear.rodeo/) extension that adds colourful atmospheric particle effects to your maps. Attach an effect to any map, then tune its look in real time with a full control panel: ten effect types, per-effect colour presets, custom colours, and live sliders for particle count, speed, and size.
 
