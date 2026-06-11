@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chromatic Weather</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg:       #0d0d14;
+      --surface:  #14141f;
+      --surface2: #1c1c2e;
+      --border:   #2a2a3e;
+      --accent:   #c77dff;
+      --accent2:  #ff6a00;
+      --text:     #e8e8f0;
+      --muted:    #7878a0;
+      --radius:   10px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); overflow-x: hidden; }
+    .panel { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+
+    .header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+    .header h1 {
+      font-family: 'Cinzel', serif; font-size: 12px; font-weight: 600; letter-spacing: 0.1em;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+
+    .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .toggle-track { width: 36px; height: 20px; background: var(--border); border-radius: 10px; position: relative; transition: background 0.2s; }
+    .toggle-track.on { background: var(--accent); }
+    .toggle-thumb { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: transform 0.2s; }
+    .toggle-track.on .toggle-thumb { transform: translateX(16px); }
+    .toggle-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .lbl { font-size: 10px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 5px; }
+
+    .effect-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+    .effect-btn {
+      padding: 7px 4px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--muted); font-family: 'Inter', sans-serif; font-size: 10px;
+      cursor: pointer; transition: all 0.15s; display: flex; flex-direction: column; align-items: center; gap: 2px;
+    }
+    .effect-btn .ic { font-size: 15px; }
+    .effect-btn:hover { border-color: var(--accent); color: var(--text); }
+    .effect-btn.active { border-color: var(--accent); background: linear-gradient(135deg, #1a0a2e, #14141f); color: var(--accent); }
+
+    .palette-row { display: flex; gap: 4px; flex-wrap: wrap; }
+    .pchip { display: flex; align-items: center; gap: 3px; padding: 3px 7px; border-radius: 20px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; font-size: 10px; color: var(--muted); transition: all 0.15s; }
+    .pchip:hover { border-color: var(--accent); color: var(--text); }
+    .pchip.active { border-color: var(--accent); background: var(--surface2); color: var(--text); }
+    .pdots { display: flex; gap: 2px; }
+    .pdot { width: 7px; height: 7px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.12); }
+
+    .divider { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+    .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+    .color-slots { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+    .cslot { position: relative; width: 32px; height: 32px; border-radius: 7px; border: 2px solid var(--border); cursor: pointer; overflow: hidden; transition: border-color 0.15s; }
+    .cslot:hover { border-color: var(--accent); }
+    .cslot input[type=color] { position: absolute; inset: -4px; width: calc(100% + 8px); height: calc(100% + 8px); opacity: 0; cursor: pointer; }
+    .cpreview { width: 100%; height: 100%; border-radius: 5px; }
+    .cremove { position: absolute; top: -5px; right: -5px; width: 13px; height: 13px; background: #e74c3c; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 9px; color: white; cursor: pointer; z-index: 2; opacity: 0; transition: opacity 0.15s; }
+    .cslot:hover .cremove { opacity: 1; }
+    .cadd-btn { width: 32px; height: 32px; border-radius: 7px; border: 2px dashed var(--border); background: transparent; color: var(--muted); font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s; line-height: 1; }
+    .cadd-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    .sliders { display: flex; flex-direction: column; gap: 8px; }
+    .srow { display: flex; flex-direction: column; gap: 2px; }
+    .shdr { display: flex; justify-content: space-between; align-items: center; }
+    .sval { font-size: 10px; color: var(--accent); font-weight: 500; min-width: 36px; text-align: right; }
+    input[type=range] { -webkit-appearance: none; width: 100%; height: 3px; background: var(--border); border-radius: 2px; outline: none; cursor: pointer; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); cursor: pointer; }
+
+    .btn-row { display: flex; gap: 7px; }
+    .apply-btn { flex: 1; padding: 10px; border-radius: var(--radius); border: none; background: linear-gradient(135deg, #7b2ff7, #c77dff); color: white; font-family: 'Cinzel', serif; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; cursor: pointer; transition: opacity 0.15s, transform 0.1s; }
+    .apply-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .apply-btn:active { transform: translateY(0); }
+    .remove-btn { padding: 10px 12px; border-radius: var(--radius); border: 1px solid #e74c3c; background: transparent; color: #e74c3c; font-family: 'Inter', sans-serif; font-size: 11px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+    .remove-btn:hover { background: #e74c3c; color: white; }
+
+    .dir-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; width: 100px; }
+    .dir-btn {
+      aspect-ratio: 1; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--muted); font-size: 13px;
+      cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center;
+    }
+    .dir-btn:hover { border-color: var(--accent); color: var(--text); }
+    .dir-btn.active { border-color: var(--accent); background: var(--surface2); color: var(--accent); }
+    .dir-btn.center { background: var(--surface2); font-size: 8px; color: var(--muted); cursor: default; }
+
+    .status { font-size: 10px; text-align: center; color: var(--accent); min-height: 13px; letter-spacing: 0.05em; }
+    .loading { text-align: center; color: var(--muted); font-size: 11px; padding: 30px 16px; }
+  </style>
+</head>
+<body>
+<div class="panel" id="panel"><div class="loading">Loading…</div></div>
+<script type="module">
+  import OBR from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3.1.0/+esm";
+
+  const PLUGIN_ID  = "com.example.chromatic-weather";
+  const META_KEY   = `${PLUGIN_ID}/settings`;
+
+  const DEFAULTS = {
+    effect:  "embers",
+    enabled: true,
+    count:   120,
+    speed:   1.0,
+    size:    1.0,
+    colors:  ["#ff6a00", "#ff9f43", "#ffe066"],
+  };
+
+  const EFFECTS = [
+    { id: "embers",    icon: "🔥", label: "Embers"    },
+    { id: "bloom",     icon: "🌸", label: "Bloom"     },
+    { id: "fireflies", icon: "✨", label: "Fireflies" },
+    { id: "snow",      icon: "❄️", label: "Snow"      },
+    { id: "rain",      icon: "🌧️", label: "Rain"      },
+    { id: "magic",     icon: "⭐", label: "Magic"     },
+    { id: "cloud",     icon: "☁️", label: "Cloud"     },
+  ];
+
+  const PRESETS = {
+    embers:    [
+      { label: "Inferno", colors: ["#ff6a00","#ff9f43","#ffe066"] },
+      { label: "Toxic",   colors: ["#39ff14","#7fff00","#b5f542"] },
+      { label: "Arcane",  colors: ["#c77dff","#9d4edd","#ff6fcf"] },
+      { label: "Frost",   colors: ["#a8d8ea","#00b4d8","#caf0f8"] },
+      { label: "Blood",   colors: ["#d62828","#f77f00","#ff4444"] },
+    ],
+    bloom:     [
+      { label: "Autumn",  colors: ["#c0392b","#e67e22","#f39c12"] },
+      { label: "Summer",  colors: ["#27ae60","#2ecc71","#a9dfbf"] },
+      { label: "Twilight",colors: ["#8e44ad","#c0392b","#e74c3c"] },
+      { label: "Biolum",  colors: ["#00f5d4","#00bbf9","#9b5de5"] },
+      { label: "Frost",   colors: ["#a8d8ea","#dfe6e9","#74b9ff"] },
+    ],
+    fireflies: [
+      { label: "Summer",  colors: ["#ffe066","#ffd166","#f4d03f"] },
+      { label: "Fae",     colors: ["#b5ead7","#c7f2a4","#e3f9a6"] },
+      { label: "Spectral",colors: ["#c0f0f0","#a8e6cf","#ffffff"] },
+      { label: "Neon",    colors: ["#ff6fcf","#ff9671","#ffd460"] },
+      { label: "Wisp",    colors: ["#e0fbfc","#98c1d9","#b8c0cc"] },
+    ],
+    snow:      [
+      { label: "Blizzard",colors: ["#ffffff","#e8f4f8","#dfe6e9"] },
+      { label: "Ash",     colors: ["#b2bec3","#636e72","#dfe6e9"] },
+      { label: "Cherry",  colors: ["#fd79a8","#fab1c8","#ffffff"] },
+      { label: "Gold",    colors: ["#ffeaa7","#fdcb6e","#ffffff"] },
+      { label: "Dust",    colors: ["#a29bfe","#fd79a8","#74b9ff"] },
+    ],
+    rain:      [
+      { label: "Storm",   colors: ["#74b9ff","#0984e3","#a8d8ea"] },
+      { label: "Acid",    colors: ["#55efc4","#00b894","#81ecec"] },
+      { label: "Blood",   colors: ["#d63031","#e17055","#ff7675"] },
+      { label: "Neon",    colors: ["#fd79a8","#a29bfe","#74b9ff"] },
+      { label: "Gold",    colors: ["#ffeaa7","#fdcb6e","#f9ca24"] },
+    ],
+    cloud:     [
+      { label: "Overcast", colors: ["#b2bec3","#dfe6e9","#ffffff"] },
+      { label: "Storm",    colors: ["#636e72","#2d3436","#b2bec3"] },
+      { label: "Toxic",    colors: ["#55efc4","#00b894","#81ecec"] },
+      { label: "Infernal", colors: ["#ff6a00","#d63031","#fdcb6e"] },
+      { label: "Arcane",   colors: ["#a29bfe","#6c5ce7","#fd79a8"] },
+    ],
+    magic:     [
+      { label: "Stars",   colors: ["#ffe066","#ffffff","#a29bfe"] },
+      { label: "Chaos",   colors: ["#ff6a00","#c77dff","#00f5d4"] },
+      { label: "Holy",    colors: ["#ffffff","#ffd700","#fffacd"] },
+      { label: "Shadow",  colors: ["#6c3483","#1b2631","#2e4057"] },
+      { label: "Nature",  colors: ["#6ab04c","#badc58","#f9ca24"] },
+    ],
+  };
+
+  let settings     = { ...DEFAULTS };
+  let customColors = [...DEFAULTS.colors];
+  let selectedItems = [];
+  let direction    = { x: 0, y: -1 }; // default: up
+
+  function colorsMatch(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  function buildUI() {
+    const panel = document.getElementById("panel");
+    panel.innerHTML = "";
+
+    const header = document.createElement("div");
+    header.className = "header";
+    header.innerHTML = `<h1>✦ Chromatic Weather</h1>`;
+    const toggle = document.createElement("div");
+    toggle.className = "toggle";
+    const track = document.createElement("div");
+    track.className = "toggle-track" + (settings.enabled ? " on" : "");
+    track.innerHTML = `<div class="toggle-thumb"></div>`;
+    toggle.appendChild(track);
+    toggle.appendChild(Object.assign(document.createElement("span"), { className: "toggle-label", textContent: "Active" }));
+    toggle.onclick = () => {
+      settings.enabled = !settings.enabled;
+      track.className = "toggle-track" + (settings.enabled ? " on" : "");
+      saveSettings();
+    };
+    header.appendChild(toggle);
+    panel.appendChild(header);
+
+    // Effect grid
+    const effSec = document.createElement("div");
+    effSec.innerHTML = `<div class="lbl">Effect Type</div>`;
+    const grid = document.createElement("div");
+    grid.className = "effect-grid";
+    for (const e of EFFECTS) {
+      const btn = document.createElement("button");
+      btn.className = "effect-btn" + (settings.effect === e.id ? " active" : "");
+      btn.innerHTML = `<span class="ic">${e.icon}</span>${e.label}`;
+      btn.onclick = () => {
+        settings.effect = e.id;
+        document.querySelectorAll(".effect-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        customColors = [...PRESETS[e.id][0].colors];
+        refreshPalettes();
+        refreshColorSlots();
+        saveSettings();
+      };
+      grid.appendChild(btn);
+    }
+    effSec.appendChild(grid);
+    panel.appendChild(effSec);
+
+    // Palette presets
+    const palSec = document.createElement("div");
+    palSec.innerHTML = `<div class="lbl">Colour Presets</div>`;
+    const palRow = document.createElement("div");
+    palRow.className = "palette-row";
+    palRow.id = "palRow";
+    palSec.appendChild(palRow);
+    panel.appendChild(palSec);
+
+    // Divider
+    const divider = document.createElement("div");
+    divider.className = "divider";
+    divider.textContent = "or custom";
+    panel.appendChild(divider);
+
+    // Custom colour slots
+    const colSec = document.createElement("div");
+    colSec.innerHTML = `<div class="lbl">Custom Colours (up to 4)</div>`;
+    const slots = document.createElement("div");
+    slots.className = "color-slots";
+    slots.id = "colorSlots";
+    colSec.appendChild(slots);
+    panel.appendChild(colSec);
+
+    // Direction control
+    const dirSec = document.createElement("div");
+    dirSec.innerHTML = `<div class="lbl">Direction</div>`;
+    const dirWrap = document.createElement("div");
+    dirWrap.style.display = "flex";
+    dirWrap.style.alignItems = "center";
+    dirWrap.style.gap = "12px";
+    const dirGrid = document.createElement("div");
+    dirGrid.className = "dir-grid";
+
+    const DIRS = [
+      { label: "↖", x: -1, y: 1  }, { label: "↑", x: 0,  y: 1  }, { label: "↗", x: 1,  y: 1  },
+      { label: "←", x: -1, y: 0  }, { label: "·", x: 0,  y: 0,  center: true }, { label: "→", x: 1,  y: 0  },
+      { label: "↙", x: -1, y: -1 }, { label: "↓", x: 0,  y: -1 }, { label: "↘", x: 1,  y: -1 },
+    ];
+    const dirBtns = [];
+    for (const d of DIRS) {
+      const btn = document.createElement("button");
+      btn.className = "dir-btn" + (d.center ? " center" : "");
+      btn.textContent = d.label;
+      if (!d.center) {
+        const isActive = Math.round(settings.direction?.x ?? 0) === d.x && Math.round(settings.direction?.y ?? 1) === d.y;
+        if (isActive) btn.classList.add("active");
+        btn.onclick = () => {
+          direction = { x: d.x, y: d.y };
+          settings.direction = direction;
+          dirBtns.forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          saveSettings();
+        };
+        dirBtns.push(btn);
+      }
+      dirGrid.appendChild(btn);
+    }
+
+    dirWrap.appendChild(dirGrid);
+    dirSec.appendChild(dirWrap);
+    panel.appendChild(dirSec);
+
+    // Sliders
+    const sliderDefs = [
+      { key: "count",   label: "Particle Count", min: 20,  max: 400, step: 10,   fmt: v => Math.round(v) },
+      { key: "speed",   label: "Speed",           min: 0.2, max: 3.0, step: 0.1,  fmt: v => v.toFixed(1) + "×" },
+      { key: "size",    label: "Size",             min: 0.3, max: 3.0, step: 0.1,  fmt: v => v.toFixed(1) + "×" },
+    ];
+    const sliderSec = document.createElement("div");
+    sliderSec.className = "sliders";
+    for (const s of sliderDefs) {
+      const row = document.createElement("div");
+      row.className = "srow";
+      const hdr = document.createElement("div");
+      hdr.className = "shdr";
+      const lbl = Object.assign(document.createElement("div"), { className: "lbl", textContent: s.label });
+      lbl.style.marginBottom = "0";
+      const val = Object.assign(document.createElement("div"), { className: "sval", textContent: s.fmt(settings[s.key]) });
+      const inp = document.createElement("input");
+      inp.type = "range"; inp.min = s.min; inp.max = s.max; inp.step = s.step; inp.value = settings[s.key];
+      inp.onchange = () => { settings[s.key] = parseFloat(inp.value); val.textContent = s.fmt(settings[s.key]); saveSettings(); };
+      inp.oninput  = () => { settings[s.key] = parseFloat(inp.value); val.textContent = s.fmt(settings[s.key]); };
+      hdr.appendChild(lbl); hdr.appendChild(val);
+      row.appendChild(hdr); row.appendChild(inp);
+      sliderSec.appendChild(row);
+    }
+    panel.appendChild(sliderSec);
+
+    // Remove button
+    const btnRow = document.createElement("div");
+    btnRow.className = "btn-row";
+    const removeBtn = Object.assign(document.createElement("button"), { className: "remove-btn", textContent: "Remove Effect" });
+    removeBtn.style.flex = "1";
+    removeBtn.onclick = async () => {
+      await OBR.scene.items.updateItems(selectedItems, (items) => {
+        for (const item of items) {
+          delete item.metadata[META_KEY];
+        }
+      });
+    };
+    btnRow.appendChild(removeBtn);
+    panel.appendChild(btnRow);
+
+    refreshPalettes();
+    refreshColorSlots();
+  }
+
+  function refreshPalettes() {
+    const row = document.getElementById("palRow");
+    if (!row) return;
+    row.innerHTML = "";
+    for (const preset of PRESETS[settings.effect] || []) {
+      const chip = document.createElement("div");
+      chip.className = "pchip" + (colorsMatch(preset.colors, customColors) ? " active" : "");
+      const dots = document.createElement("div");
+      dots.className = "pdots";
+      for (const c of preset.colors) {
+        const d = document.createElement("div");
+        d.className = "pdot"; d.style.background = c;
+        dots.appendChild(d);
+      }
+      chip.appendChild(dots);
+      chip.appendChild(document.createTextNode(preset.label));
+      chip.onclick = () => {
+        customColors = [...preset.colors];
+        settings.colors = [...customColors];
+        refreshPalettes();
+        refreshColorSlots();
+        saveSettings();
+      };
+      row.appendChild(chip);
+    }
+  }
+
+  function refreshColorSlots() {
+    const slots = document.getElementById("colorSlots");
+    if (!slots) return;
+    slots.innerHTML = "";
+    for (let i = 0; i < customColors.length; i++) {
+      const slot = document.createElement("div");
+      slot.className = "cslot";
+      const preview = Object.assign(document.createElement("div"), { className: "cpreview" });
+      preview.style.background = customColors[i];
+      const inp = document.createElement("input");
+      inp.type = "color"; inp.value = customColors[i];
+      const idx = i;
+      inp.oninput  = () => { customColors[idx] = inp.value; preview.style.background = inp.value; refreshPalettes(); };
+      inp.onchange = () => { customColors[idx] = inp.value; settings.colors = [...customColors]; saveSettings(); };
+      const rem = Object.assign(document.createElement("div"), { className: "cremove", textContent: "×" });
+      rem.onclick = (ev) => {
+        ev.stopPropagation();
+        if (customColors.length > 1) {
+          customColors.splice(idx, 1);
+          settings.colors = [...customColors];
+          refreshColorSlots();
+          refreshPalettes();
+          saveSettings();
+        }
+      };
+      slot.appendChild(preview); slot.appendChild(inp); slot.appendChild(rem);
+      slots.appendChild(slot);
+    }
+    if (customColors.length < 4) {
+      const add = Object.assign(document.createElement("button"), { className: "cadd-btn", textContent: "+" });
+      add.onclick = () => {
+        customColors.push("#ffffff");
+        settings.colors = [...customColors];
+        refreshColorSlots();
+        refreshPalettes();
+        saveSettings();
+      };
+      slots.appendChild(add);
+    }
+  }
+
+  async function saveSettings() {
+    if (!selectedItems.length) return;
+    settings.colors = [...customColors];
+    try {
+      await OBR.scene.items.updateItems(selectedItems, (items) => {
+        for (const item of items) {
+          item.metadata[META_KEY] = { ...settings };
+        }
+      });
+    } catch (err) {
+      console.error("Chromatic Weather: failed to save", err);
+    }
+  }
+
+  // ── Init — mirrors exactly how native weather menu.tsx works ─────────────
+  OBR.onReady(async () => {
+    // Get the current player selection — this is set when the context menu was opened
+    const selection = await OBR.player.getSelection();
+    if (!selection || selection.length === 0) {
+      document.getElementById("panel").innerHTML = `<div class="loading">No map selected.</div>`;
+      return;
+    }
+
+    // Get the actual items from the selection
+    const items = await OBR.scene.items.getItems(selection);
+    selectedItems = items;
+
+    // Read existing settings from the first item
+    if (items.length > 0 && items[0].metadata && items[0].metadata[META_KEY]) {
+      const stored = items[0].metadata[META_KEY];
+      settings     = { ...DEFAULTS, ...stored };
+      customColors = settings.colors ? [...settings.colors] : [...DEFAULTS.colors];
+      direction    = settings.direction || { x: 0, y: -1 };
+    }
+
+    buildUI();
+
+    // Keep UI in sync if settings change externally
+    OBR.scene.items.onChange((allItems) => {
+      const updated = allItems.filter(item => selection.includes(item.id));
+      if (updated.length > 0 && updated[0].metadata && updated[0].metadata[META_KEY]) {
+        selectedItems = updated;
+        const stored = updated[0].metadata[META_KEY];
+        settings     = { ...DEFAULTS, ...stored };
+        customColors = settings.colors ? [...settings.colors] : [...DEFAULTS.colors];
+        direction    = settings.direction || { x: 0, y: -1 };
+        buildUI();
+      }
+    });
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chromatic Weather Background</title>
+</head>
+<body>
+<!-- Chromatic Weather v1.3 -->
+<script type="module">
+import OBR, { buildEffect } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3.1.0/+esm";
+
+const PLUGIN_ID = "com.example.chromatic-weather";
+const META_KEY  = `${PLUGIN_ID}/settings`;
+
+// ── Shared utility SKSL (inlined since we can't use #include) ─────────────────
+
+const UTIL_FBM = `
+float noise(in vec2 p) { return sin(p.x) * sin(p.y); }
+mat2 rot = mat2(0.80, 0.60, -0.60, 0.80);
+float fbm4(vec2 p) {
+  float f = 0.0;
+  f += 0.5000 * noise(p); p = rot * p * 2.02;
+  f += 0.2500 * noise(p); p = rot * p * 2.03;
+  f += 0.1250 * noise(p); p = rot * p * 2.01;
+  f += 0.0625 * noise(p);
+  return f / 0.9375;
+}
+float fbm6(vec2 p) {
+  float f = 0.0;
+  f += 0.500000 * noise(p); p = rot * p * 2.02;
+  f += 0.250000 * noise(p); p = rot * p * 2.03;
+  f += 0.125000 * noise(p); p = rot * p * 2.01;
+  f += 0.062500 * noise(p); p = rot * p * 2.04;
+  f += 0.031250 * noise(p); p = rot * p * 2.01;
+  f += 0.015625 * noise(p);
+  return f / 0.96875;
+}
+`;
+
+const UTIL_LINE = `
+float lineD(vec2 p, vec2 start, vec2 end) {
+  vec2 ba = end - start; vec2 pa = p - start;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - h * ba);
+}
+vec2 rot2(vec2 p, float angle) {
+  return mat2(cos(angle), sin(angle), -sin(angle), cos(angle)) * p;
+}
+void animatedLine(vec2 p, float jitter, float baseLength, float spd, vec2 dir, inout float minDist, inout vec2 minPoint) {
+  vec2 tileInt = floor(p); vec2 tileFrac = fract(p);
+  for(int j = -1; j <= 1; j++) {
+    for(int i = -1; i <= 1; i++) {
+      vec2 neighbor = vec2(float(i), float(j));
+      vec2 point = hash2(tileInt + neighbor);
+      float s = (point.x * 2.0 - 1.0) * 0.01;
+      point = 0.5 + 0.5 * sin(time * spd * point * jitter);
+      vec2 diff = neighbor + point - tileFrac;
+      float lineLen = dot(point, vec2(0.520, 0.440)) * 0.05 * baseLength;
+      vec2 d = dir * spd - point;
+      vec2 rotated = rot2(diff, -atan(d.y, d.x));
+      float dist = lineD(rotated, -vec2(lineLen, 0.0), vec2(lineLen, 0.0)) - s;
+      if(dist < minDist) { minDist = dist; minPoint = point; }
+    }
+  }
+}
+`;
+
+const UTIL_CIRCLE = `
+void animatedCircle(vec2 p, float jitter, float spd, inout float minDist, inout vec2 minPoint) {
+  vec2 tileInt = floor(p); vec2 tileFrac = fract(p);
+  for(int j = -1; j <= 1; j++) {
+    for(int i = -1; i <= 1; i++) {
+      vec2 neighbor = vec2(float(i), float(j));
+      vec2 point = hash2(tileInt + neighbor);
+      point = 0.5 + 0.5 * sin(time * spd + jitter * point);
+      vec2 diff = neighbor + point - tileFrac;
+      float dist = length(diff);
+      if(dist < minDist) { minDist = dist; minPoint = point; }
+    }
+  }
+}
+`;
+
+// ── Uniforms header shared by all shaders ─────────────────────────────────────
+
+const UNIFORMS_HEADER = `
+uniform float time;
+uniform vec2 size;
+uniform vec2 direction;
+uniform float speed;
+uniform float density;
+uniform float particleSize;
+uniform vec3 color1;
+uniform vec3 color2;
+uniform vec3 color3;
+
+vec2 hash2(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+float hash1(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * .1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+`;
+
+// ── Color selector helper ─────────────────────────────────────────────────────
+
+const COLOR_PICKER = `
+vec3 pickColor(float seed) {
+  if (seed < 0.333) return color1;
+  else if (seed < 0.666) return color2;
+  else return color3;
+}
+`;
+
+// ── Shaders ───────────────────────────────────────────────────────────────────
+
+const SHADER_SNOW = UNIFORMS_HEADER + UTIL_CIRCLE + COLOR_PICKER + `
+float snowFlake(vec2 p, float jitter, vec2 dir, float spd, float sz) {
+  p += time * dir * spd * vec2(-1.0, 1.0);
+  float minDist = 10.; vec2 minPoint;
+  animatedCircle(p, jitter, spd, minDist, minPoint);
+  float scale = dot(minPoint, vec2(0.4, 0.4)) - 0.2 - sz;
+  float blur = sz * 0.2;
+  return 1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist);
+}
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  float baseSpeed = pow(speed - 0.5, 1.5);
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float sz = 0.18 * particleSize;
+  float alpha = 0.0;
+  vec3 col = vec3(0.0);
+  float a1 = snowFlake(p * 8.0 * tiling, 8.363, direction, 0.884 * baseSpeed, sz * 0.08);
+  col += pickColor(0.1) * a1; alpha += a1;
+  float a2 = snowFlake(p * (density > 1.0 ? 15.0 : 5.0) * tiling, 11.683, direction, 0.824 * baseSpeed, sz * 0.25);
+  col += pickColor(0.5) * a2; alpha += a2;
+  if (density > 2.0) {
+    float a3 = snowFlake(p * 30.0 * tiling, 14.2, direction, 1.1 * baseSpeed, sz * 0.15);
+    col += pickColor(0.8) * a3; alpha += a3;
+  }
+  return vec4(col, min(alpha, 1.0) * 0.85);
+}`;
+
+const SHADER_RAIN = UNIFORMS_HEADER + UTIL_LINE + UTIL_FBM + COLOR_PICKER + `
+float rain(vec2 p, float jitter, vec2 dir, float spd, float sz, float lineLength) {
+  p += time * dir * spd * vec2(-1.0, 1.0);
+  float minDist = 10.; vec2 minPoint;
+  animatedLine(p, jitter, lineLength * spd, spd, dir * vec2(-1.0, 1.0), minDist, minPoint);
+  return 1.0 - step(sz * particleSize, minDist);
+}
+float mist(vec2 p, float spd) {
+  vec2 anim = direction * time * spd * vec2(-1.0, 1.0) * 0.1;
+  vec2 innerP = p + anim * 0.1;
+  vec2 q = vec2(fbm4(innerP), fbm4(innerP + vec2(5.452)));
+  return fbm6(p + anim + q * 0.1);
+}
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  float baseSpeed = pow(speed - 0.5, 2.0);
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float alpha = 0.0;
+  vec3 col = vec3(0.0);
+
+  // Fixed tiling so drop size is always consistent regardless of density.
+  // Density controls how visible/opaque drops are instead.
+  float opacityScale = clamp(density / 3.0, 0.1, 1.0);
+
+  float a1 = rain(p * 20.0 * tiling, 0.2, direction, baseSpeed + 5.0, 0.014, 0.6) * opacityScale;
+  col += pickColor(0.2) * a1; alpha += a1;
+
+  // Second layer only at medium+ density
+  if (density > 2.0) {
+    float a2 = rain(p * 30.0 * tiling, 0.4, direction, baseSpeed + 10.0, 0.02, 0.8) * opacityScale;
+    col += pickColor(0.6) * a2; alpha += a2;
+  }
+
+  // Mist only at heavy rain
+  if (density > 4.0) {
+    float a3 = mist(p * 5.0 * tiling, baseSpeed + 5.0) * 0.5 * opacityScale;
+    col += pickColor(0.9) * a3; alpha += a3;
+  }
+
+  return vec4(col, min(alpha, 1.0) * 0.5);
+}`;
+
+const SHADER_EMBERS = UNIFORMS_HEADER + UTIL_LINE + COLOR_PICKER + `
+vec3 emberColor(float x, vec3 baseCol) {
+  return baseCol * (exp(-x * 0.1) + 0.2) * (1.0 - exp(-x * 5.0));
+}
+vec4 ember(vec2 p, float jitter, vec2 dir, float spd, float sz, float lineLength) {
+  p += time * dir * spd * vec2(-1.0, 1.0);
+  float minDist = 10.; vec2 minPoint;
+  animatedLine(p, jitter, lineLength + spd * 0.1, spd, dir * vec2(-1.0, 1.0), minDist, minPoint);
+  float scale = dot(minPoint, vec2(0.8, 0.8));
+  float blur = sz * particleSize * 1.5;
+  float s = sz * particleSize;
+  float line = 1.0 - smoothstep(s * scale - blur, s * scale + blur, minDist);
+  vec3 c = pickColor(hash1(minPoint));
+  return vec4(line * emberColor(clamp(1.0 - minDist * 2.5, 0.0, 1.0), c), line);
+}
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  float baseSpeed = pow(speed - 0.5, 2.0);
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  vec4 color = vec4(0.0);
+  color += ember(p * 5.0 * tiling, 0.8, direction, baseSpeed * 0.2 + 0.2, 0.014, 0.25);
+  if (density > 1.0) color += ember(p * 20.0 * tiling, 1.2, direction, baseSpeed * 0.25 + 1.0, 0.03, 0.5);
+  if (density > 2.0) color += ember(p * 30.0 * tiling, 1.2, direction, baseSpeed * 0.25 + 1.5, 0.04, 0.75);
+  if (density > 3.0) color += ember(p * 40.0 * tiling, 0.8, direction, baseSpeed * 0.25 + 2.5, 0.05, 1.0);
+  return color;
+}`;
+
+const SHADER_BLOOM = UNIFORMS_HEADER + COLOR_PICKER + `
+float leafSDF(vec2 p, float sz) {
+  // Rotate so leaf falls naturally
+  float c = 0.7071, s = 0.7071;
+  p = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+  // Lens shape for body
+  float a = sz * 1.8;
+  float b = sz * 0.5;
+  float d = length(vec2(p.x * (b / a), p.y)) - b;
+  // Pinch tips to make it pointy
+  d += abs(p.x) * 0.3;
+  // Stem: thin line extending from the base
+  float stemLen = sz * 0.8;
+  float stemW = sz * 0.06;
+  vec2 stemP = p - vec2(sz * 0.9, 0.0);
+  float stem = length(vec2(max(abs(stemP.x) - stemLen * 0.5, 0.0), stemP.y)) - stemW;
+  return min(d, stem);
+}
+
+half4 main(float2 coord) {
+  vec2 uv = coord / size;
+  uv.x *= size.x / size.y;
+  float aspect = size.x / size.y;
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float baseSpeed = max(speed * 0.08, 0.02);
+
+  vec3 col = vec3(0.0);
+  float alpha = 0.0;
+
+  for (int i = 0; i < 32; i++) {
+    float fi = float(i);
+    float seed1 = hash1(vec2(fi * 1.234, 5.678));
+    float seed2 = hash1(vec2(fi * 9.1,   2.345));
+    float seed3 = hash1(vec2(fi * 3.7,   7.654));
+    float seed4 = hash1(vec2(fi * 6.2,   1.111));
+
+    float t = fract(time * baseSpeed * (0.6 + seed2 * 0.8) + seed1);
+
+    float fallX = seed3 * aspect
+                  + direction.x * t * 0.5 * tiling
+                  + sin(t * 6.28 * (1.0 + seed4) + seed1 * 6.28) * 0.04 * tiling;
+    float fallY = 1.0 - t + direction.y * t * 0.3 * tiling;
+
+    float angle = t * 6.28 * 2.0 * (seed2 > 0.5 ? 1.0 : -1.0) + seed3 * 6.28;
+
+    // Default size is ~0.3x of original — much smaller baseline
+    float leafSz = (0.004 + seed4 * 0.006) * particleSize * tiling;
+
+    vec2 toLeaf = uv - vec2(fallX, fallY);
+    float ca = cos(angle), sa = sin(angle);
+    vec2 localP = vec2(ca * toLeaf.x + sa * toLeaf.y,
+                      -sa * toLeaf.x + ca * toLeaf.y);
+
+    float fade = smoothstep(0.0, 0.1, t) * smoothstep(1.0, 0.85, t);
+
+    float d = leafSDF(localP, leafSz);
+    float a = (1.0 - smoothstep(0.0, leafSz * 0.3, d)) * fade;
+
+    vec3 c = pickColor(seed1);
+    col += c * a;
+    alpha += a;
+  }
+
+  return vec4(col, min(alpha, 1.0));
+}`;
+
+const SHADER_CLOUD = UNIFORMS_HEADER + UTIL_FBM + COLOR_PICKER + `
+float cloud(vec2 p, float spd, float animSpeed, float innerAnimSpeed, float detail) {
+  vec2 anim = direction * time * spd * vec2(-1.0, 1.0) * animSpeed;
+  vec2 innerP = p + anim * innerAnimSpeed;
+  vec2 q = vec2(fbm4(innerP), fbm4(innerP + vec2(5.452)));
+  return clamp(fbm6(p + anim + q * detail), 0.0, 1.0);
+}
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  p = 0.5 + 0.5 * p;
+  float baseSpeed = pow(speed - 0.5, 1.5);
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float alpha = 0.0;
+  vec3 col = vec3(0.0);
+  float a1 = cloud(p * 3.0 * tiling, baseSpeed * 0.3 + 0.25, 0.2, 0.1, 0.5) * 0.8;
+  col += pickColor(0.1) * a1; alpha += a1;
+  if (density > 1.0) { float a2 = cloud(p * 5.0 * tiling, baseSpeed * 0.3 + 0.25, 0.4, 0.1, 0.8) * 0.5; col += pickColor(0.5) * a2; alpha += a2; }
+  if (density > 2.0) { float a3 = cloud(p * 2.0 * tiling, baseSpeed * 0.3 + 0.25, 0.1, 0.1, 0.3) * 0.5; col += pickColor(0.8) * a3; alpha += a3; }
+  if (density > 3.0) { float a4 = cloud(p * 1.2 * tiling, baseSpeed * 0.3 + 0.25, 0.05, 0.1, 0.2) * 0.5; col += pickColor(0.3) * a4; alpha += a4; }
+  return vec4(col, clamp(alpha, 0.0, 1.5));
+}`;
+
+const SHADER_FIREFLIES = UNIFORMS_HEADER + UTIL_CIRCLE + COLOR_PICKER + `
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  float baseSpeed = pow(speed - 0.5, 1.5) * 0.3;
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float sz = 0.04 * particleSize;
+  float alpha = 0.0; vec3 col = vec3(0.0);
+  // Fireflies: slow wandering circles with pulsing glow
+  float minDist = 10.; vec2 minPoint;
+  animatedCircle(p * 4.0 * tiling, 3.0, baseSpeed * 0.5, minDist, minPoint);
+  float scale = dot(minPoint, vec2(0.4, 0.4)) - 0.2 - sz;
+  float blur = sz * 0.4;
+  float pulse = 0.5 + 0.5 * sin(time * (1.0 + hash1(minPoint) * 2.0));
+  float a1 = (1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist)) * pulse;
+  col += pickColor(hash1(minPoint)) * a1; alpha += a1;
+  float minDist2 = 10.; vec2 minPoint2;
+  animatedCircle(p * 6.0 * tiling * density * 0.4, 5.0, baseSpeed * 0.7, minDist2, minPoint2);
+  float scale2 = dot(minPoint2, vec2(0.4, 0.4)) - 0.2 - sz * 0.6;
+  float pulse2 = 0.5 + 0.5 * sin(time * (2.0 + hash1(minPoint2) * 3.0) + 1.57);
+  float a2 = (1.0 - smoothstep(sz * 0.6 * scale2 - blur, sz * 0.6 * scale2 + blur, minDist2)) * pulse2;
+  col += pickColor(hash1(minPoint2)) * a2; alpha += a2;
+  return vec4(col, min(alpha, 1.0) * 0.9);
+}`;
+
+const SHADER_MAGIC = UNIFORMS_HEADER + UTIL_LINE + COLOR_PICKER + `
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  float baseSpeed = pow(speed - 0.5, 2.0) * 0.5 + 0.2;
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  float sz = 0.008 * particleSize;
+  vec4 color = vec4(0.0);
+  // Magic: rising spiraling sparks using line primitives at spiral angles
+  float minDist = 10.; vec2 minPoint;
+  animatedLine(p * 10.0 * tiling, 1.5, 0.3 + baseSpeed * 0.3, baseSpeed + 0.5, vec2(direction.x * 0.3, 1.0), minDist, minPoint);
+  float scale = dot(minPoint, vec2(0.8, 0.8));
+  float blur = sz * 2.0;
+  float line1 = 1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist);
+  vec3 c1 = pickColor(hash1(minPoint));
+  color += vec4(c1 * line1, line1);
+  if (density > 1.0) {
+    float minDist2 = 10.; vec2 minPoint2;
+    animatedLine(p * 20.0 * tiling, 2.5, 0.5 + baseSpeed * 0.4, baseSpeed + 1.0, vec2(direction.x * 0.2, 0.8), minDist2, minPoint2);
+    float scale2 = dot(minPoint2, vec2(0.8, 0.8));
+    float line2 = 1.0 - smoothstep(sz * 0.7 * scale2 - blur, sz * 0.7 * scale2 + blur, minDist2);
+    vec3 c2 = pickColor(hash1(minPoint2));
+    color += vec4(c2 * line2 * 1.5, line2);
+  }
+  return color;
+}`;
+
+// ── Shader map ────────────────────────────────────────────────────────────────
+
+const SHADERS = {
+  embers:    SHADER_EMBERS,
+  bloom:     SHADER_BLOOM,
+  fireflies: SHADER_FIREFLIES,
+  snow:      SHADER_SNOW,
+  rain:      SHADER_RAIN,
+  magic:     SHADER_MAGIC,
+  cloud:     SHADER_CLOUD,
+};
+
+// ── Active effects: mapItemId -> localEffectId ────────────────────────────────
+
+const activeEffects = new Map();
+
+function hexToVec3(hex) {
+  hex = hex.replace('#', '');
+  if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+  return {
+    x: parseInt(hex.slice(0, 2), 16) / 255,
+    y: parseInt(hex.slice(2, 4), 16) / 255,
+    z: parseInt(hex.slice(4, 6), 16) / 255,
+  };
+}
+
+function buildUniforms(s) {
+  const colors = (s.colors && s.colors.length) ? s.colors : ["#ff6a00", "#ff9f43", "#ffe066"];
+  const c1 = hexToVec3(colors[0] || "#ff6a00");
+  const c2 = hexToVec3(colors[1] || colors[0] || "#ff6a00");
+  const c3 = hexToVec3(colors[2] || colors[0] || "#ff6a00");
+
+  // Direction: default upward (embers rise). direction is {x, y} in world space
+  const dir = s.direction || { x: 0, y: -1 };
+
+  return [
+    { name: "speed",        value: s.speed        ?? 1.0 },
+    { name: "density",      value: (s.count / 120.0) * 3.0 },
+    { name: "particleSize", value: s.size         ?? 1.0 },
+    { name: "direction",    value: dir },
+    { name: "color1",       value: c1 },
+    { name: "color2",       value: c2 },
+    { name: "color3",       value: c3 },
+  ];
+}
+
+async function addEffect(parentItem, settings) {
+  const sksl = SHADERS[settings.effect] || SHADER_EMBERS;
+  const effect = buildEffect()
+    .attachedTo(parentItem.id)
+    .visible(true)
+    .position(parentItem.position)
+    .rotation(parentItem.rotation)
+    .effectType("ATTACHMENT")
+    .sksl(sksl)
+    .uniforms(buildUniforms(settings))
+    .locked(true)
+    .disableHit(true)
+    .disableAttachmentBehavior(["COPY"])
+    .disableAutoZIndex(true)
+    .layer("RULER")
+    .zIndex(0)
+    .build();
+
+  await OBR.scene.local.addItems([effect]);
+  activeEffects.set(parentItem.id, effect.id);
+  console.log("Chromatic Weather: added effect", effect.id, "for", parentItem.id);
+}
+
+async function updateEffect(effectId, settings) {
+  const sksl = SHADERS[settings.effect] || SHADER_EMBERS;
+  const uniforms = buildUniforms(settings);
+  await OBR.scene.local.updateItems(
+    (item) => item.id === effectId,
+    (items) => {
+      for (const item of items) {
+        item.sksl = sksl;
+        item.uniforms = uniforms;
+      }
+    }
+  );
+}
+
+async function removeEffect(effectId) {
+  await OBR.scene.local.deleteItems([effectId]);
+}
+
+async function reconcileItems(items) {
+  const withSettings = new Map();
+  for (const item of items) {
+    if (item.metadata && item.metadata[META_KEY]) {
+      const s = item.metadata[META_KEY];
+      if (s && s.enabled !== false) {
+        withSettings.set(item.id, { item, settings: s });
+      }
+    }
+  }
+
+  for (const [itemId, { item, settings }] of withSettings) {
+    if (activeEffects.has(itemId)) {
+      await updateEffect(activeEffects.get(itemId), settings);
+    } else {
+      await addEffect(item, settings);
+    }
+  }
+
+  for (const [itemId, effectId] of activeEffects) {
+    if (!withSettings.has(itemId)) {
+      await removeEffect(effectId);
+      activeEffects.delete(itemId);
+    }
+  }
+}
+
+// ── OBR Init ──────────────────────────────────────────────────────────────────
+
+OBR.onReady(() => {
+  // Menu 1: Add — shown on maps WITHOUT our metadata
+  OBR.contextMenu.create({
+    id: `${PLUGIN_ID}/menu-add`,
+    icons: [{
+      icon: "/icon.svg",
+      label: "Add Chromatic Weather",
+      filter: {
+        every: [
+          { key: "layer", value: "MAP", coordinator: "||" },
+          { key: "layer", value: "FOG" },
+          { key: ["metadata", META_KEY], value: undefined },
+        ],
+        permissions: ["UPDATE"],
+      },
+    }],
+    async onClick(context) {
+      await OBR.scene.items.updateItems(context.items, (items) => {
+        for (const item of items) {
+          item.metadata[META_KEY] = {
+            effect:    "embers",
+            enabled:   true,
+            count:     120,
+            speed:     1.0,
+            size:      1.0,
+            opacity:   0.85,
+            direction: { x: 0, y: 1 },
+            colors:    ["#ff6a00", "#ff9f43", "#ffe066"],
+          };
+        }
+      });
+    },
+  });
+
+  // Menu 2: Settings — shown on maps WITH our metadata, uses embed
+  OBR.contextMenu.create({
+    id: `${PLUGIN_ID}/menu-settings`,
+    icons: [{
+      icon: "/icon.svg",
+      label: "Chromatic Weather",
+      filter: {
+        every: [
+          { key: "layer", value: "MAP", coordinator: "||" },
+          { key: "layer", value: "FOG" },
+          { key: ["metadata", META_KEY], value: undefined, operator: "!=" },
+        ],
+        permissions: ["UPDATE"],
+      },
+    }],
+    embed: {
+      url: "/menu.html",
+      height: 600,
+    },
+  });
+
+  const handleSceneReady = async (ready) => {
+    if (ready) {
+      try {
+        const items = await OBR.scene.items.getItems();
+        await reconcileItems(items);
+      } catch(e) {
+        console.log("Chromatic Weather: scene error", e);
+      }
+    } else {
+      activeEffects.clear();
+    }
+  };
+
+  OBR.scene.items.onChange(reconcileItems);
+  OBR.scene.onReadyChange(handleSceneReady);
+  OBR.scene.isReady().then(handleSceneReady);
+
+  console.log("Chromatic Weather: background ready");
+});
+</script>
+</body>
+</html>
