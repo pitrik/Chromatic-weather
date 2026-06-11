@@ -1,5 +1,37 @@
 <!DOCTYPE html>
 <html lang="en">
+<!--
+  ============================================================================
+  CHROMATIC WEATHER — menu.html  (the control panel UI)
+  ============================================================================
+  This is the popup panel a GM uses to configure a weather effect on a map.
+  It runs inside an Owlbear "popover" iframe that background.html opens.
+
+  HOW THE PIECES FIT TOGETHER
+  ---------------------------
+  • background.html  — runs the actual shaders on the map and opens this panel.
+  • menu.html (this) — the UI. Reads/writes the effect settings, which are
+                       stored in the map item's metadata. background.html
+                       watches that metadata and updates the visuals live.
+
+  The two talk ONLY through the selected map item's metadata (key META_KEY).
+  When you change a control here, we write the new settings to that metadata
+  via the Owlbear SDK; background.html reacts and re-renders the effect.
+
+  WHAT YOU'LL LIKELY WANT TO EDIT
+  -------------------------------
+  • EFFECTS        — the list of effect buttons (id + icon + label).
+  • PRESETS        — the colour-preset chips per effect.
+  • EFFECT_DEFAULTS— starting count/speed/size (and opacity) per effect.
+  • INERT_CONTROLS — which controls to grey out per effect (e.g. direction).
+  • sliderDefs     — the count/speed/size slider ranges.
+  • buildUI()      — how the panel is laid out (the 2x2 grid of sections).
+  Each of these is commented where it appears below.
+
+  NOTE: this file is mostly plain DOM construction (createElement/append) so
+  it has no build step — what you see is what runs.
+  ============================================================================
+-->
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -19,8 +51,40 @@
       --radius:   10px;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); overflow-x: hidden; }
-    .panel { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+    /* Full-viewport transparent stage. pointer-events:none lets map clicks pass
+       THROUGH everywhere; only the panel re-enables pointer-events, so the map stays
+       interactive while the panel floats over it. The panel is draggable by its
+       header and starts in the bottom-left corner (with margin to clear OBR's UI). */
+    html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+    body { font-family: 'Inter', sans-serif; color: var(--text); }
+    #stage { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .panel {
+      position: absolute; width: 580px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+      padding: 16px; display: flex; flex-direction: column; gap: 12px;
+      pointer-events: auto;  /* re-enable interaction on the panel itself */
+      max-height: calc(100% - 32px); overflow-y: auto;
+    }
+    /* Header doubles as the drag handle. */
+    .header { cursor: move; user-select: none; }
+    /* 2x2 grid: columns align, and rows align ACROSS columns (top row sizes to the
+       taller top cell; both bottom cells share the next row line). Vertical separator
+       runs down the middle via a right border on the left-side cells. */
+    .cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 20px; row-gap: 14px; }
+    .gcell { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+    .gcell.tl, .gcell.bl { padding-right: 20px; border-right: 1px solid var(--border); }
+    /* Full-width rule between the top and bottom grid rows. grid-column 1 / -1 makes
+       it span both columns so the line runs edge to edge. */
+    .row-rule { grid-column: 1 / -1; height: 1px; background: var(--border); margin: 2px 0; }
+    /* The bottom-right cell hosts the "or" connector in its left gutter. */
+    .gcell.has-or { position: relative; }
+    .or-label {
+      position: absolute; left: -14px; bottom: 9px;
+      transform: translateX(-50%);
+      font-size: 10px; font-style: italic; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted); pointer-events: none;
+    }
 
     .header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
     .header h1 {
@@ -35,6 +99,9 @@
     .toggle-thumb { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: transform 0.2s; }
     .toggle-track.on .toggle-thumb { transform: translateX(16px); }
     .toggle-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .remember-row { margin-top: 10px; }
+    .close-btn { margin-left: 12px; width: 30px; height: 30px; flex: none; border-radius: 7px; border: 1px solid var(--accent); background: var(--surface2); color: var(--text); font-size: 15px; font-weight: 600; cursor: pointer; line-height: 1; transition: all 0.15s; }
+    .close-btn:hover { background: var(--accent); color: #fff; transform: scale(1.05); }
 
     .lbl { font-size: 10px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 5px; }
 
@@ -91,19 +158,27 @@
     .dir-btn:hover { border-color: var(--accent); color: var(--text); }
     .dir-btn.active { border-color: var(--accent); background: var(--surface2); color: var(--accent); }
     .dir-btn.center { background: var(--surface2); font-size: 8px; color: var(--muted); cursor: default; }
+    /* Inert-control state: applied to a whole control section when the active effect
+       ignores it (e.g. direction for fireflies). Dimmed, non-interactive. */
+    .ctrl-disabled { opacity: 0.35; pointer-events: none; }
+    .ctrl-disabled .dir-btn { cursor: not-allowed; }
 
     .status { font-size: 10px; text-align: center; color: var(--accent); min-height: 13px; letter-spacing: 0.05em; }
     .loading { text-align: center; color: var(--muted); font-size: 11px; padding: 30px 16px; }
   </style>
 </head>
 <body>
-<div class="panel" id="panel"><div class="loading">Loading…</div></div>
+<div id="stage">
+  <div class="panel" id="panel"><div class="loading">Loading…</div></div>
+</div>
 <script type="module">
   import OBR from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3.1.0/+esm";
 
   const PLUGIN_ID  = "com.example.chromatic-weather";
   const META_KEY   = `${PLUGIN_ID}/settings`;
 
+  // Fallback settings used if a map item has no saved settings yet. Individual
+  // effects override count/speed/size via EFFECT_DEFAULTS below.
   const DEFAULTS = {
     effect:  "embers",
     enabled: true,
@@ -113,16 +188,27 @@
     colors:  ["#ff6a00", "#ff9f43", "#ffe066"],
   };
 
+  // The effect picker buttons, in display order. To ADD an effect: add an entry
+  // here (id must match the shader key in background.html's SHADERS map), then add
+  // matching entries in PRESETS, EFFECT_DEFAULTS, and the CALIBRATION table in
+  // background.html. `icon` is an emoji or an inline SVG string.
   const EFFECTS = [
     { id: "embers",    icon: "🔥", label: "Embers"    },
     { id: "bloom",     icon: "🍂", label: "Leaves"     },
     { id: "fireflies", icon: "✨", label: "Fireflies" },
     { id: "snow",      icon: "❄️", label: "Snow"      },
     { id: "rain",      icon: "🌧️", label: "Rain"      },
-    { id: "magic",     icon: "⭐", label: "Magic"     },
+    { id: "toprain",   icon: `<svg viewBox="0 0 24 24" width="15" height="15" style="vertical-align:middle"><g stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"><line x1="12" y1="2"  x2="12" y2="7"/><line x1="12" y1="22" x2="12" y2="17"/><line x1="2"  y1="12" x2="7"  y2="12"/><line x1="22" y1="12" x2="17" y2="12"/><line x1="4.5" y1="4.5"  x2="8"  y2="8"/><line x1="19.5" y1="4.5" x2="16" y2="8"/><line x1="4.5" y1="19.5" x2="8"  y2="16"/><line x1="19.5" y1="19.5" x2="16" y2="16"/></g></svg>`, label: "Top Down Rain" },
     { id: "cloud",     icon: "☁️", label: "Cloud"     },
+    { id: "fog",       icon: "🌫️", label: "Fog"       },
+    { id: "dust",      icon: "🌫", label: "Dust"      },
+    { id: "bubbles",   icon: "🫧", label: "Bubbles"   },
   ];
 
+  // Colour-preset chips per effect. Each preset is up to 3 hex colours (the shaders
+  // use 3 colours; see pickColor in background.html). The first preset listed is the
+  // default when an effect is first selected. To restyle an effect or add a preset,
+  // edit its array here — purely cosmetic, no shader changes needed.
   const PRESETS = {
     embers:    [
       { label: "Inferno", colors: ["#ff6a00","#ff9f43","#ffe066"] },
@@ -153,7 +239,14 @@
       { label: "Dust",    colors: ["#a29bfe","#fd79a8","#74b9ff"] },
     ],
     rain:      [
-      { label: "Storm",   colors: ["#74b9ff","#0984e3","#a8d8ea"] },
+      { label: "Storm",   colors: ["#c1d1e2","#85a7c1","#a8d8ea"] },
+      { label: "Acid",    colors: ["#55efc4","#00b894","#81ecec"] },
+      { label: "Blood",   colors: ["#d63031","#e17055","#ff7675"] },
+      { label: "Neon",    colors: ["#fd79a8","#a29bfe","#74b9ff"] },
+      { label: "Gold",    colors: ["#ffeaa7","#fdcb6e","#f9ca24"] },
+    ],
+    toprain:   [
+      { label: "Storm",   colors: ["#c1d1e2","#85a7c1","#a8d8ea"] },
       { label: "Acid",    colors: ["#55efc4","#00b894","#81ecec"] },
       { label: "Blood",   colors: ["#d63031","#e17055","#ff7675"] },
       { label: "Neon",    colors: ["#fd79a8","#a29bfe","#74b9ff"] },
@@ -166,21 +259,155 @@
       { label: "Infernal", colors: ["#ff6a00","#d63031","#fdcb6e"] },
       { label: "Arcane",   colors: ["#a29bfe","#6c5ce7","#fd79a8"] },
     ],
-    magic:     [
-      { label: "Stars",   colors: ["#ffe066","#ffffff","#a29bfe"] },
-      { label: "Chaos",   colors: ["#ff6a00","#c77dff","#00f5d4"] },
-      { label: "Holy",    colors: ["#ffffff","#ffd700","#fffacd"] },
-      { label: "Shadow",  colors: ["#6c3483","#1b2631","#2e4057"] },
-      { label: "Nature",  colors: ["#6ab04c","#badc58","#f9ca24"] },
+    fog:       [
+      { label: "Grey Mist", colors: ["#9aa5ad","#cfd6db","#b8c1c7"] },
+      { label: "Graveyard", colors: ["#6b7a5e","#aebfa0","#869178"] },
+      { label: "Swamp",     colors: ["#6ab04c","#badc58","#7bed9f"] },
+      { label: "Cursed",    colors: ["#8e44ad","#5f27cd","#341f97"] },
+      { label: "Ember Haze", colors: ["#ff7675","#fab1a0","#e17055"] },
+    ],
+    dust:      [
+      { label: "Sunbeam",  colors: ["#ffeaa7","#fdcb6e","#fff5d7"] },
+      { label: "Ash",      colors: ["#b2bec3","#636e72","#dfe6e9"] },
+      { label: "Spores",   colors: ["#a8e6a3","#74b49b","#c7f2a4"] },
+      { label: "Pollen",   colors: ["#ffe066","#f6e58d","#fff3b0"] },
+      { label: "Arcane",   colors: ["#c7a9ff","#a29bfe","#dcd0ff"] },
+    ],
+    bubbles:   [
+      { label: "Water",    colors: ["#a8d8ea","#caf0f8","#ffffff"] },
+      { label: "Deep Sea", colors: ["#48cae4","#00b4d8","#90e0ef"] },
+      { label: "Swamp Gas", colors: ["#9bb53c","#badc58","#d8e063"] },
+      { label: "Potion",   colors: ["#c77dff","#ff6fcf","#e0aaff"] },
+      { label: "Poison",   colors: ["#55efc4","#00b894","#81ecec"] },
     ],
   };
+
+  // Per-effect slider defaults — MUST stay in sync with CALIBRATION[effect].defaults
+  // in background.html. Applied (resetting count/speed/size) when an effect is picked.
+  // Starting slider values applied when an effect is first selected. These are the
+  // RAW slider values (count 20–400, speed 0.2–3.0, size 0.3–3.0); background.html's
+  // CALIBRATION table converts them to shader inputs. Tweak these to change how an
+  // effect looks "out of the box". `opacity` (cloud only) sets its map-safe alpha cap.
+  // Note fog deliberately starts denser/slower (160/0.7/1.4) for thick roiling fog.
+  const EFFECT_DEFAULTS = {
+    embers:    { count: 120, speed: 1.0, size: 1.0 },
+    bloom:     { count: 120, speed: 1.0, size: 1.0 },
+    fireflies: { count: 120, speed: 1.0, size: 1.0 },
+    snow:      { count: 120, speed: 1.0, size: 1.0 },
+    rain:      { count: 120, speed: 1.0, size: 1.0 },
+    toprain:   { count: 120, speed: 1.0, size: 1.0 },
+    cloud:     { count: 120, speed: 1.0, size: 1.0, opacity: 0.55 },
+    fog:       { count: 160, speed: 0.7, size: 1.4 },
+    dust:      { count: 120, speed: 1.0, size: 1.0 },
+    bubbles:   { count: 120, speed: 1.0, size: 1.0 },
+  };
+  // Returns the default slider values for an effect (falls back to embers).
+  function effectDefaults(effect) {
+    return EFFECT_DEFAULTS[effect] || EFFECT_DEFAULTS.embers;
+  }
+
+  // Controls that have no effect for a given effect, so the menu greys them out.
+  // Fireflies wander randomly and top-down rain converges inward from all edges, so
+  // neither uses direction. Add an effect here with the control names it ignores.
+  const INERT_CONTROLS = {
+    fireflies: ["direction"],
+    toprain:   ["direction"],
+    dust:      ["direction"],
+    bubbles:   ["direction"],
+  };
+  function applyInertControls(effect) {
+    const inert = INERT_CONTROLS[effect] || [];
+    const dirSec = document.getElementById("dirSection");
+    if (dirSec) dirSec.classList.toggle("ctrl-disabled", inert.includes("direction"));
+  }
 
   let settings     = { ...DEFAULTS };
   let customColors = [...DEFAULTS.colors];
   let selectedItems = [];
   let direction    = { x: 0, y: -1 }; // default: up
 
+  // "Remember settings" feature (session-only, per-map). When ON, switching effects
+  // restores that effect's last-used settings ON THIS MAP instead of resetting to
+  // defaults. Stored in memory only (keyed by item id -> effect id), so it lasts for
+  // the life of this open panel but is forgotten on reload — by design. The toggle
+  // itself defaults OFF (i.e. the original reset-to-defaults behaviour).
+  let rememberEnabled = false;
+  const rememberedSettings = {};   // { itemId: { effectId: {count,speed,size,opacity,colors} } }
+
+  // Snapshot the current effect's settings into the per-map store (called before
+  // switching away from an effect, so we can restore it later).
+  function rememberCurrent() {
+    const id = selectedItems[0] && selectedItems[0].id;
+    if (!id) return;
+    if (!rememberedSettings[id]) rememberedSettings[id] = {};
+    rememberedSettings[id][settings.effect] = {
+      count:   settings.count,
+      speed:   settings.speed,
+      size:    settings.size,
+      opacity: settings.opacity,
+      direction: settings.direction ? { ...settings.direction } : undefined,
+      colors:  [...customColors],
+    };
+  }
+
+  // Get remembered settings for an effect on the current map, or null if none.
+  function recallFor(effectId) {
+    const id = selectedItems[0] && selectedItems[0].id;
+    if (!id || !rememberedSettings[id]) return null;
+    return rememberedSettings[id][effectId] || null;
+  }
+
   function colorsMatch(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  // Place the panel in the bottom-left corner with margin to clear OBR's own UI.
+  // Called once on open (the iframe reloads each open, so this re-runs each time).
+  function placePanel() {
+    const stage = document.getElementById("stage");
+    const panel = document.getElementById("panel");
+    if (!stage || !panel) return;
+    const margin = 16;
+    const sh = stage.clientHeight, ph = panel.offsetHeight;
+    panel.style.left = margin + "px";
+    panel.style.top  = Math.max(margin, sh - ph - margin) + "px";
+  }
+
+  // Drag the panel by its header. Pointer events (mouse + touch). The capture is on
+  // the panel so a fast drag doesn't "fall off" onto the click-through stage.
+  function initDrag() {
+    const panel = document.getElementById("panel");
+    if (!panel || panel.dataset.dragInit) return;
+    panel.dataset.dragInit = "1";
+    let dragging = false, offX = 0, offY = 0;
+    panel.addEventListener("pointerdown", (e) => {
+      const header = e.target.closest(".header");
+      if (!header) return;
+      if (e.target.closest(".toggle") || e.target.closest(".close-btn")) return;
+      dragging = true;
+      offX = e.clientX - panel.offsetLeft;
+      offY = e.clientY - panel.offsetTop;
+      panel.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    panel.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const stage = document.getElementById("stage");
+      let left = e.clientX - offX, top = e.clientY - offY;
+      // Clamp so the panel can't be dragged fully off-screen.
+      const maxL = (stage ? stage.clientWidth  : window.innerWidth)  - panel.offsetWidth  - 8;
+      const maxT = (stage ? stage.clientHeight : window.innerHeight) - panel.offsetHeight - 8;
+      left = Math.max(8, Math.min(left, maxL));
+      top  = Math.max(8, Math.min(top,  maxT));
+      panel.style.left = left + "px";
+      panel.style.top  = top + "px";
+    });
+    const endDrag = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try { panel.releasePointerCapture(e.pointerId); } catch (err) {}
+    };
+    panel.addEventListener("pointerup", endDrag);
+    panel.addEventListener("pointercancel", endDrag);
+  }
 
   function buildUI() {
     const panel = document.getElementById("panel");
@@ -201,10 +428,50 @@
       track.className = "toggle-track" + (settings.enabled ? " on" : "");
       saveSettings();
     };
-    header.appendChild(toggle);
+    const headerRight = document.createElement("div");
+    headerRight.style.display = "flex";
+    headerRight.style.alignItems = "center";
+    headerRight.appendChild(toggle);
+    // Close button — dismisses the popover (popovers don't auto-close like the old
+    // inline embed did when the context menu was dismissed).
+    const closeBtn = Object.assign(document.createElement("button"), {
+      className: "close-btn", textContent: "✕", title: "Close",
+    });
+    closeBtn.onclick = () => {
+      try { OBR.popover.close(`${PLUGIN_ID}/settings-popover`); } catch (e) {}
+    };
+    headerRight.appendChild(closeBtn);
+    header.appendChild(headerRight);
     panel.appendChild(header);
 
-    // Effect grid
+    // Two-column body: LEFT = identity (effect, presets, colours);
+    // RIGHT = tuning (direction, sliders). Remove button spans full width below.
+    // 2x2 GRID so rows align ACROSS columns: top row = effect grid (L) / direction+
+    // sliders (R); bottom row = presets (L) / custom colours (R). Grid rows share a
+    // baseline, so presets and custom colours line up horizontally regardless of the
+    // differing top-cell heights (effect grid is taller than direction+sliders, so a
+    // gap appears under the sliders — the accepted tradeoff for alignment).
+    const cols = document.createElement("div");
+    cols.className = "cols";
+    const cellTL = document.createElement("div"); cellTL.className = "gcell tl";
+    const cellTR = document.createElement("div"); cellTR.className = "gcell tr";
+    // Full-width horizontal rule separating the top row (effect/direction/sliders)
+    // from the bottom row (colour options). It spans BOTH grid columns so the line
+    // runs edge to edge, crossing the vertical separator.
+    const rowRule = document.createElement("div");
+    rowRule.className = "row-rule";
+    const cellBL = document.createElement("div"); cellBL.className = "gcell bl";
+    const cellBR = document.createElement("div"); cellBR.className = "gcell br";
+    cols.appendChild(cellTL);
+    cols.appendChild(cellTR);
+    cols.appendChild(rowRule);
+    cols.appendChild(cellBL);
+    cols.appendChild(cellBR);
+    panel.appendChild(cols);
+    // Aliases so the section-building code below reads naturally by placement.
+    const leftCol = cellTL, rightCol = cellTR, leftBottom = cellBL, rightBottom = cellBR;
+
+    // Effect grid (LEFT)
     const effSec = document.createElement("div");
     effSec.innerHTML = `<div class="lbl">Effect Type</div>`;
     const grid = document.createElement("div");
@@ -214,45 +481,71 @@
       btn.className = "effect-btn" + (settings.effect === e.id ? " active" : "");
       btn.innerHTML = `<span class="ic">${e.icon}</span>${e.label}`;
       btn.onclick = () => {
+        // Snapshot the effect we're leaving (so it can be recalled later if remember
+        // is on). Harmless to always do this.
+        rememberCurrent();
+
         settings.effect = e.id;
-        document.querySelectorAll(".effect-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        customColors = [...PRESETS[e.id][0].colors];
-        refreshPalettes();
-        refreshColorSlots();
+
+        const remembered = rememberEnabled ? recallFor(e.id) : null;
+        if (remembered) {
+          // Restore this effect's last-used settings on this map.
+          settings.count   = remembered.count;
+          settings.speed   = remembered.speed;
+          settings.size    = remembered.size;
+          if (typeof remembered.opacity === "number") settings.opacity = remembered.opacity;
+          if (remembered.direction) {
+            direction = { ...remembered.direction };
+            settings.direction = direction;
+          }
+          customColors = [...remembered.colors];
+        } else {
+          // Reset sliders to this effect's own defaults (per-effect isolation).
+          const d = effectDefaults(e.id);
+          settings.count = d.count;
+          settings.speed = d.speed;
+          settings.size  = d.size;
+          // Per-effect opacity default (cloud sets its map-safe alpha ceiling).
+          if (typeof d.opacity === "number") settings.opacity = d.opacity;
+          customColors = [...PRESETS[e.id][0].colors];
+        }
+        settings.colors = [...customColors];
         saveSettings();
+        buildUI(); // full re-render so sliders reflect the restored/default values
       };
       grid.appendChild(btn);
     }
     effSec.appendChild(grid);
-    panel.appendChild(effSec);
+    leftCol.appendChild(effSec);
 
-    // Palette presets
+    // Palette presets (LEFT)
     const palSec = document.createElement("div");
     palSec.innerHTML = `<div class="lbl">Colour Presets</div>`;
     const palRow = document.createElement("div");
     palRow.className = "palette-row";
     palRow.id = "palRow";
     palSec.appendChild(palRow);
-    panel.appendChild(palSec);
+    leftBottom.appendChild(palSec);
 
-    // Divider
-    const divider = document.createElement("div");
-    divider.className = "divider";
-    divider.textContent = "or custom";
-    panel.appendChild(divider);
-
-    // Custom colour slots
+    // Custom colour slots — built here, appended to the RIGHT column below the
+    // sliders (see after sliderSec) for visual balance per the layout mockup.
     const colSec = document.createElement("div");
-    colSec.innerHTML = `<div class="lbl">Custom Colours (up to 4)</div>`;
+    colSec.innerHTML = `<div class="lbl">Custom Colours (up to 3)</div>`;
     const slots = document.createElement("div");
     slots.className = "color-slots";
     slots.id = "colorSlots";
     colSec.appendChild(slots);
-    panel.appendChild(colSec);
+    // "OR" connector in the gutter to the LEFT of the custom-colour swatches, making
+    // it explicit that presets (left column) and custom colours (right column) are
+    // alternatives. Absolutely positioned in the bottom-right cell's left padding,
+    // vertically centred on the swatch row.
+    const orLabel = document.createElement("div");
+    orLabel.className = "or-label";
+    orLabel.textContent = "or";
 
-    // Direction control
+    // Direction control (RIGHT)
     const dirSec = document.createElement("div");
+    dirSec.id = "dirSection";
     dirSec.innerHTML = `<div class="lbl">Direction</div>`;
     const dirWrap = document.createElement("div");
     dirWrap.style.display = "flex";
@@ -288,9 +581,12 @@
 
     dirWrap.appendChild(dirGrid);
     dirSec.appendChild(dirWrap);
-    panel.appendChild(dirSec);
+    rightCol.appendChild(dirSec);
 
-    // Sliders
+    // The three sliders. min/max/step define the range; fmt formats the displayed
+    // value. These RAW values are remapped per-effect by background.html's
+    // CALIBRATION table, so changing a range here changes what the ends of the slider
+    // mean for every effect. `key` matches the settings field the slider controls.
     const sliderDefs = [
       { key: "count",   label: "Particle Count", min: 20,  max: 400, step: 10,   fmt: v => Math.round(v) },
       { key: "speed",   label: "Speed",           min: 0.2, max: 3.0, step: 0.1,  fmt: v => v.toFixed(1) + "×" },
@@ -314,9 +610,35 @@
       row.appendChild(hdr); row.appendChild(inp);
       sliderSec.appendChild(row);
     }
-    panel.appendChild(sliderSec);
+    rightCol.appendChild(sliderSec);
+    // "Remember settings" toggle — placed under the sliders since those (plus
+    // direction/colours) are what it remembers. When ON, switching effects restores
+    // that effect's last-used settings on this map instead of resetting to defaults.
+    const remRow = document.createElement("div");
+    remRow.className = "remember-row";
+    const remToggle = document.createElement("div");
+    remToggle.className = "toggle";
+    const remTrack = document.createElement("div");
+    remTrack.className = "toggle-track" + (rememberEnabled ? " on" : "");
+    remTrack.innerHTML = `<div class="toggle-thumb"></div>`;
+    remToggle.appendChild(remTrack);
+    remToggle.appendChild(Object.assign(document.createElement("span"), {
+      className: "toggle-label", textContent: "Remember settings",
+    }));
+    remToggle.onclick = () => {
+      // Turning remember ON snapshots the current effect immediately, so it's
+      // available to recall if the user switches away and back.
+      rememberEnabled = !rememberEnabled;
+      if (rememberEnabled) rememberCurrent();
+      remTrack.className = "toggle-track" + (rememberEnabled ? " on" : "");
+    };
+    remRow.appendChild(remToggle);
+    rightCol.appendChild(remRow);
+    rightBottom.classList.add("has-or");
+    rightBottom.appendChild(orLabel);
+    rightBottom.appendChild(colSec);
 
-    // Remove button
+    // Remove button — full width, centred below both columns.
     const btnRow = document.createElement("div");
     btnRow.className = "btn-row";
     const removeBtn = Object.assign(document.createElement("button"), { className: "remove-btn", textContent: "Remove Effect" });
@@ -333,6 +655,11 @@
 
     refreshPalettes();
     refreshColorSlots();
+    applyInertControls(settings.effect);
+    initDrag();
+    // Place bottom-left only on the first build (open); later re-renders (effect
+    // switches) must not yank a moved panel back to the corner.
+    if (!buildUI._placed) { placePanel(); buildUI._placed = true; }
   }
 
   function refreshPalettes() {
@@ -390,7 +717,11 @@
       slot.appendChild(preview); slot.appendChild(inp); slot.appendChild(rem);
       slots.appendChild(slot);
     }
-    if (customColors.length < 4) {
+    // Cap at 3 colours: pickColor() in the shaders is 3-colour (color1/2/3) and a
+    // 4th was always silently ignored. Three already spreads thin across the layer
+    // bands, so more would blend worse, not better. (Items saved with 4 from before
+    // still display their 4 harmlessly and can be trimmed down; none can be re-added.)
+    if (customColors.length < 3) {
       const add = Object.assign(document.createElement("button"), { className: "cadd-btn", textContent: "+" });
       add.onclick = () => {
         customColors.push("#ffffff");
@@ -403,6 +734,10 @@
     }
   }
 
+  // THE core write. Called whenever any control changes. Writes the current settings
+  // into the selected map item's metadata; background.html watches that metadata and
+  // re-renders the effect live. This is the ONLY channel between this panel and the
+  // visuals — there are no direct function calls between the two files.
   async function saveSettings() {
     if (!selectedItems.length) return;
     settings.colors = [...customColors];

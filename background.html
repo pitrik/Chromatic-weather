@@ -1,5 +1,40 @@
 <!DOCTYPE html>
 <html lang="en">
+<!--
+  ============================================================================
+  CHROMATIC WEATHER — background.html  (the engine)
+  ============================================================================
+  This runs invisibly in the background and does the actual work: it draws the
+  weather effects onto map items using Owlbear "effect" items, whose visuals
+  are SKSL shaders (Skia's shading language, similar to GLSL).
+
+  HOW THE PIECES FIT TOGETHER
+  ---------------------------
+  • background.html (this) — renders effects + opens the control panel popover.
+  • menu.html              — the control panel UI the GM interacts with.
+
+  They communicate ONLY through the map item's metadata (key META_KEY). The
+  menu writes settings there; the code below watches for metadata changes and
+  rebuilds/updates the effect on that item.
+
+  THE SHADER PIPELINE (top to bottom in this file)
+  ------------------------------------------------
+  1. Shared SKSL snippets (UTIL_*, UNIFORMS_HEADER, COLOR_PICKER) — inlined
+     because SKSL has no #include. Every shader string is concatenated from
+     these plus its own body.
+  2. One SHADER_* string per effect (embers, bloom, cloud, fog, dust, ...).
+  3. SHADERS map — effect id -> shader string.
+  4. CALIBRATION map — converts the menu's raw sliders (count/speed/size) into
+     the uniforms each shader expects. This is per-effect so tuning one effect
+     never affects another. THIS is usually where you tune an effect's feel.
+  5. Reconcile logic — keeps live effect items in sync with item metadata.
+  6. OBR init — context-menu entries (Add / settings) and the popover opener.
+
+  GOTCHA: never put a backtick inside an SKSL string (even in a comment) — the
+  whole shader is a JS template literal, so a stray backtick ends it early and
+  breaks the file. Validate JS with `node --check` after editing.
+  ============================================================================
+-->
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -94,6 +129,8 @@ uniform float particleSize;
 uniform vec3 color1;
 uniform vec3 color2;
 uniform vec3 color3;
+uniform float cloudCap;
+uniform float gridDpi;
 
 vec2 hash2(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
@@ -119,7 +156,7 @@ vec3 pickColor(float seed) {
 
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
-const SHADER_SNOW = UNIFORMS_HEADER + UTIL_CIRCLE + COLOR_PICKER + `
+const SHADER_SNOW = UNIFORMS_HEADER + UTIL_CIRCLE + UTIL_FBM + COLOR_PICKER + `
 float snowFlake(vec2 p, float jitter, vec2 dir, float spd, float sz) {
   p += time * dir * spd * vec2(-1.0, 1.0);
   float minDist = 10.; vec2 minPoint;
@@ -127,6 +164,13 @@ float snowFlake(vec2 p, float jitter, vec2 dir, float spd, float sz) {
   float scale = dot(minPoint, vec2(0.4, 0.4)) - 0.2 - sz;
   float blur = sz * 0.2;
   return 1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist);
+}
+// Drifting FBM haze for white-out / blizzard conditions (ported from rain mist).
+float snowHaze(vec2 p, float spd) {
+  vec2 anim = direction * time * spd * vec2(-1.0, 1.0) * 0.08;
+  vec2 innerP = p + anim * 0.1;
+  vec2 q = vec2(fbm4(innerP), fbm4(innerP + vec2(5.452)));
+  return fbm6(p + anim + q * 0.12);
 }
 half4 main(float2 coord) {
   vec2 p = coord / size;
@@ -136,15 +180,72 @@ half4 main(float2 coord) {
   float sz = 0.18 * particleSize;
   float alpha = 0.0;
   vec3 col = vec3(0.0);
-  float a1 = snowFlake(p * 8.0 * tiling, 8.363, direction, 0.884 * baseSpeed, sz * 0.08);
-  col += pickColor(0.1) * a1; alpha += a1;
-  float a2 = snowFlake(p * (density > 1.0 ? 15.0 : 5.0) * tiling, 11.683, direction, 0.824 * baseSpeed, sz * 0.25);
-  col += pickColor(0.5) * a2; alpha += a2;
-  if (density > 2.0) {
-    float a3 = snowFlake(p * 30.0 * tiling, 14.2, direction, 1.1 * baseSpeed, sz * 0.15);
-    col += pickColor(0.8) * a3; alpha += a3;
+
+  // d: 0..1 across the FULL count slider. count 200 ~ d 0.47. Flake quantity now
+  // ramps from SPARSE at count 20 (base layers fade from a low floor) up to a
+  // higher-than-before maximum reached by ~count 200, via four weighted tiers.
+  float d = clamp(density, 0.0, 1.0);
+  float wA = mix(0.35, 1.0, smoothstep(0.0, 0.30, d)); // base fades in: sparse at 20
+  float wB = smoothstep(0.02, 0.28, d);                // second copies (low)
+  float wC = smoothstep(0.12, 0.42, d);                // third copies (low/mid)
+  float wD = smoothstep(0.25, 0.50, d);                // fourth copies -> new higher max
+
+  // --- base: one layer per size (small / medium / large), faded by wA ---
+  float aLarge = snowFlake(p * 5.0  * tiling, 8.363,  direction, 0.884 * baseSpeed, sz * 0.25) * wA;
+  float aMed   = snowFlake(p * 9.0  * tiling, 11.683, direction, 0.900 * baseSpeed, sz * 0.15) * wA;
+  float aSmall = snowFlake(p * 16.0 * tiling, 14.200, direction, 1.000 * baseSpeed, sz * 0.08) * wA;
+  col += pickColor(0.5) * aLarge; alpha += aLarge;
+  col += pickColor(0.3) * aMed;   alpha += aMed;
+  col += pickColor(0.1) * aSmall; alpha += aSmall;
+
+  // --- count adds more of EACH size (different tilings = distinct flakes) ---
+  float bLarge = snowFlake(p * 6.5  * tiling, 5.21,  direction, 0.870 * baseSpeed, sz * 0.25) * wB;
+  float bMed   = snowFlake(p * 11.0 * tiling, 9.07,  direction, 0.920 * baseSpeed, sz * 0.15) * wB;
+  float bSmall = snowFlake(p * 20.0 * tiling, 17.31, direction, 1.050 * baseSpeed, sz * 0.08) * wB;
+  col += pickColor(0.5) * bLarge; alpha += bLarge;
+  col += pickColor(0.3) * bMed;   alpha += bMed;
+  col += pickColor(0.1) * bSmall; alpha += bSmall;
+
+  float cLarge = snowFlake(p * 7.5  * tiling, 3.91,  direction, 0.860 * baseSpeed, sz * 0.25) * wC;
+  float cMed   = snowFlake(p * 13.0 * tiling, 6.66,  direction, 0.940 * baseSpeed, sz * 0.15) * wC;
+  float cSmall = snowFlake(p * 24.0 * tiling, 21.7,  direction, 1.080 * baseSpeed, sz * 0.08) * wC;
+  col += pickColor(0.5) * cLarge; alpha += cLarge;
+  col += pickColor(0.3) * cMed;   alpha += cMed;
+  col += pickColor(0.1) * cSmall; alpha += cSmall;
+
+  // --- fourth tier: extra density for a fuller maximum than before ---
+  float dLarge = snowFlake(p * 9.0  * tiling, 2.13,  direction, 0.890 * baseSpeed, sz * 0.25) * wD;
+  float dMed   = snowFlake(p * 15.0 * tiling, 7.77,  direction, 0.960 * baseSpeed, sz * 0.15) * wD;
+  float dSmall = snowFlake(p * 28.0 * tiling, 19.4,  direction, 1.100 * baseSpeed, sz * 0.08) * wD;
+  col += pickColor(0.5) * dLarge; alpha += dLarge;
+  col += pickColor(0.3) * dMed;   alpha += dMed;
+  col += pickColor(0.1) * dSmall; alpha += dSmall;
+
+  // --- blizzard haze: builds from ~mid count (d 0.55) upward ---
+  float wHaze = smoothstep(0.55, 0.9, d);
+  if (wHaze > 0.0) {
+    float h = snowHaze(p * 5.0 * tiling, baseSpeed + 4.0);
+    float haze = h * wHaze * 0.55;          // gradual blizzard
+    col += pickColor(0.1) * haze; alpha += haze;
   }
-  return vec4(col, min(alpha, 1.0) * 0.85);
+
+  // --- extreme white-out: ONLY at the very top (count ~350+, d 0.87 -> 1.0) ---
+  // Cloudlike, not blobby: two large-scale FBM samples drifting at different rates
+  // are blended smoothly (no hard threshold), so it reads as soft sheets of blowing
+  // snow rather than pixelated noise.
+  float wWhiteout = smoothstep(0.87, 1.0, d);
+  if (wWhiteout > 0.0) {
+    float h1 = snowHaze(p * 2.0 * tiling, baseSpeed + 3.0);   // big soft clouds
+    float h2 = snowHaze(p * 3.5 * tiling + vec2(13.7, 4.2), baseSpeed + 6.0); // finer drift
+    float cloud = h1 * 0.65 + h2 * 0.45;                      // layered depth
+    cloud = smoothstep(0.1, 0.9, cloud);                     // gentle, wide ramp
+    float whiteout = cloud * wWhiteout;
+    col += pickColor(0.1) * whiteout; alpha += whiteout;
+  }
+
+  // Alpha cap normally 0.85, lifting toward fully opaque during extreme white-out.
+  float cap = mix(0.85, 1.0, wWhiteout);
+  return vec4(col, min(alpha, 1.0) * cap);
 }`;
 
 const SHADER_RAIN = UNIFORMS_HEADER + UTIL_LINE + UTIL_FBM + COLOR_PICKER + `
@@ -194,8 +295,19 @@ const SHADER_EMBERS = UNIFORMS_HEADER + UTIL_LINE + COLOR_PICKER + `
 vec3 emberColor(float x, vec3 baseCol) {
   return baseCol * (exp(-x * 0.1) + 0.2) * (1.0 - exp(-x * 5.0));
 }
-vec4 ember(vec2 p, float jitter, vec2 dir, float spd, float sz, float lineLength) {
+vec4 ember(vec2 p, float jitter, vec2 dir, float spd, float sz, float lineLength, float sway) {
   p += time * dir * spd * vec2(-1.0, 1.0);
+  // Meander: push the sample sideways (perpendicular to drift) with two
+  // out-of-phase low-frequency sines so embers wander in a loose, non-uniform
+  // path instead of drifting straight. Phase depends on position so neighbours
+  // sway independently. sway scales amplitude per layer.
+  vec2 driftDir = normalize(dir * vec2(-1.0, 1.0) + vec2(0.0001, 0.0));
+  vec2 perp = vec2(-driftDir.y, driftDir.x);
+  float t = time * spd;
+  float lateral =
+      sin(p.y * 1.3 + t * 0.6) * 0.6
+    + sin(p.x * 0.7 - t * 0.37 + 1.7) * 0.4;
+  p += perp * lateral * sway;
   float minDist = 10.; vec2 minPoint;
   animatedLine(p, jitter, lineLength + spd * 0.1, spd, dir * vec2(-1.0, 1.0), minDist, minPoint);
   float scale = dot(minPoint, vec2(0.8, 0.8));
@@ -208,28 +320,49 @@ vec4 ember(vec2 p, float jitter, vec2 dir, float spd, float sz, float lineLength
 half4 main(float2 coord) {
   vec2 p = coord / size;
   p.x *= size.x / size.y;
+  // speedMul scales ALL motion so the low end is genuinely slow. At slider min
+  // (speed 0.2) this is ~0.18; at 1.0 it's ~1.0; at max it climbs above 1.
+  float speedMul = mix(0.18, 1.0, smoothstep(0.2, 1.0, speed)) + max(speed - 1.0, 0.0) * 0.7;
   float baseSpeed = pow(speed - 0.5, 2.0);
   float tiling = max(size.x, size.y) / 150.0 / 20.0;
+
+  // count (density, ~0..1 across the slider) controls how many LAYERS are active.
+  // Each active layer is a full set of embers, so adding/removing a layer genuinely
+  // adds/removes embers (not just dimming). Layers fade via smoothstep weights so
+  // the transition is smooth, and a partially-faded layer is naturally dimmer too.
+  //
+  // The ALWAYS-ON base is the mid-size layer (20x), so the lowest count shows a few
+  // medium embers. The big embers (5x) and the finer ones (30x, 40x) fade in as
+  // count rises — giving size variety that grows with quantity.
+  float d = clamp(density, 0.0, 1.0);
+  float wMid  = mix(0.45, 1.0, smoothstep(0.0, 0.5, d)); // 20x — always on, lifts in
+  float wBig  = smoothstep(0.10, 0.55, d);               // 5x  — biggest, fades in
+  float wFine = smoothstep(0.35, 0.80, d);               // 30x — fades in mid-range
+  float wFinest = smoothstep(0.60, 1.0, d);              // 40x — only at high count
+
+  // sway = lateral meander amplitude per layer (bigger/slower embers wander more)
   vec4 color = vec4(0.0);
-  color += ember(p * 5.0 * tiling, 0.8, direction, baseSpeed * 0.2 + 0.2, 0.014, 0.25);
-  if (density > 1.0) color += ember(p * 20.0 * tiling, 1.2, direction, baseSpeed * 0.25 + 1.0, 0.03, 0.5);
-  if (density > 2.0) color += ember(p * 30.0 * tiling, 1.2, direction, baseSpeed * 0.25 + 1.5, 0.04, 0.75);
-  if (density > 3.0) color += ember(p * 40.0 * tiling, 0.8, direction, baseSpeed * 0.25 + 2.5, 0.05, 1.0);
+  color += ember(p * 20.0 * tiling, 1.2, direction, (baseSpeed * 0.25 + 1.0) * speedMul, 0.03,  0.5 , 0.06) * wMid;
+  color += ember(p * 5.0  * tiling, 0.8, direction, (baseSpeed * 0.2  + 0.2) * speedMul, 0.014, 0.25, 0.12) * wBig;
+  color += ember(p * 30.0 * tiling, 1.2, direction, (baseSpeed * 0.25 + 1.5) * speedMul, 0.04,  0.75, 0.04) * wFine;
+  color += ember(p * 40.0 * tiling, 0.8, direction, (baseSpeed * 0.25 + 2.5) * speedMul, 0.05,  1.0 , 0.03) * wFinest;
   return color;
 }`;
 
 const SHADER_BLOOM = UNIFORMS_HEADER + COLOR_PICKER + `
-float leafSDF(vec2 p, float sz) {
-  // Rotate so leaf falls naturally
+// ── Leaf shapes ───────────────────────────────────────────────────────────────
+// Three signed-distance shapes, all authored to roughly fill the same radius so
+// they mix at one size. Each takes local point p (already un-rotated by caller)
+// and sz (leaf size). Negative inside, positive outside.
+
+// BIRCH / generic ovate: pinched lens body + thin stem. (original shape)
+float leafBirch(vec2 p, float sz) {
   float c = 0.7071, s = 0.7071;
   p = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
-  // Lens shape for body
   float a = sz * 1.8;
   float b = sz * 0.5;
   float d = length(vec2(p.x * (b / a), p.y)) - b;
-  // Pinch tips to make it pointy
-  d += abs(p.x) * 0.3;
-  // Stem: thin line extending from the base
+  d += abs(p.x) * 0.3;                       // pinch tips
   float stemLen = sz * 0.8;
   float stemW = sz * 0.06;
   vec2 stemP = p - vec2(sz * 0.9, 0.0);
@@ -237,34 +370,130 @@ float leafSDF(vec2 p, float sz) {
   return min(d, stem);
 }
 
+// MAPLE: 5 pointed lobes radiating from centre, via polar radius modulation.
+// MAPLE: union of 5 elongated tapered lobes (1 up, 2 inner-angled, 2 outer) giving
+// crisp pointed tips and notches — the classic maple silhouette. Each lobe is a
+// capsule from centre to a clamped tip with width tapering to a point.
+float mapleLobe(vec2 p, float sz, float angDeg, float len, float wid) {
+  float rad = radians(angDeg);
+  vec2 ax = vec2(sin(rad), cos(rad));   // axis toward tip (up = +y)
+  float t = clamp(dot(p, ax), 0.0, sz * len);
+  float w = wid * sz * (1.0 - 0.85 * (t / (sz * len)));
+  vec2 c = ax * t;
+  return length(p - c) - w;
+}
+float leafMaple(vec2 p, float sz) {
+  // Shift so the leaf's visual mass is centred on the origin (it rotates about the
+  // origin; without this the top-heavy lobes would orbit rather than spin in place).
+  p.y -= sz * 0.45;
+  float d = mapleLobe(p, sz,   0.0, 1.30, 0.28);
+  d = min(d, mapleLobe(p, sz,  40.0, 1.05, 0.24));
+  d = min(d, mapleLobe(p, sz, -40.0, 1.05, 0.24));
+  d = min(d, mapleLobe(p, sz,  85.0, 0.80, 0.20));
+  d = min(d, mapleLobe(p, sz, -85.0, 0.80, 0.20));
+  // stem downward (short, connected to leaf base)
+  vec2 stemP = p - vec2(0.0, -sz * 0.55);
+  float stem = length(vec2(stemP.x, max(abs(stemP.y) - sz * 0.18, 0.0))) - sz * 0.045;
+  return min(d, stem);
+}
+
+// OAK: elongated vertical body, half-width = elliptical taper * rounded-lobe
+// modulation, giving smooth lobed sides and rounded ends.
+float leafOak(vec2 p, float sz) {
+  float L = sz * 1.5;                       // half-length along y
+  float t = p.y / L;                        // -1..1 along length
+  float body;
+  if (abs(t) > 1.05) {
+    body = 100.0;
+  } else {
+    float envelope = sqrt(max(0.0, 1.0 - t * t));    // rounded taper at ends
+    float lobes = 0.72 + 0.28 * cos(t * 3.14159 * 3.0); // 3 rounded lobes/side
+    float w = sz * 0.62 * envelope * lobes;
+    body = abs(p.x) - w;
+  }
+  // stem downward
+  vec2 stemP = p - vec2(0.0, -sz * 1.25);
+  float stem = length(vec2(stemP.x, max(abs(stemP.y) - sz * 0.45, 0.0))) - sz * 0.05;
+  return min(body, stem);
+}
+
+// Dispatcher: shapeId 0=birch, 1=maple, 2=oak.
+float leafSDF(vec2 p, float sz, int shapeId) {
+  if (shapeId == 1) return leafMaple(p, sz);
+  if (shapeId == 2) return leafOak(p, sz);
+  return leafBirch(p, sz);
+}
+
 half4 main(float2 coord) {
   vec2 uv = coord / size;
   uv.x *= size.x / size.y;
   float aspect = size.x / size.y;
-  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+  // GRID-RELATIVE size: one grid square spans (gridDpi/size.y) in uv-y units. Sizing
+  // particles as (fraction * gridScale) makes them a CONSTANT fraction of a grid tile,
+  // so they're the same real-world size on every map regardless of its dimensions
+  // (a 24x16 map and a 50x60 map render identical-sized leaves). The 19.2 constant is
+  // calibrated to the look dialed in on a 24x16 tile map; change it to scale all of
+  // bloom/dust/bubbles together, or change each effect's base fraction individually.
+  float gridScale = gridDpi / size.y;     // uv-y units per grid square
   float baseSpeed = max(speed * 0.08, 0.02);
 
   vec3 col = vec3(0.0);
   float alpha = 0.0;
 
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < 96; i++) {
     float fi = float(i);
     float seed1 = hash1(vec2(fi * 1.234, 5.678));
     float seed2 = hash1(vec2(fi * 9.1,   2.345));
     float seed3 = hash1(vec2(fi * 3.7,   7.654));
     float seed4 = hash1(vec2(fi * 6.2,   1.111));
+    // Independent seed for the count gate, so which leaves are hidden at low count
+    // is UNCORRELATED with colour (seed1), position (seed3), etc. Without this, the
+    // gate revealing low-seed1 leaves first would only show the first colour.
+    float gateSeed = hash1(vec2(fi * 4.81, 13.97));
+    // Independent seed for SHAPE: 0=birch, 1=maple, 2=oak, evenly split. Uncorrelated
+    // with colour/gate so shape, colour, and visibility all vary independently.
+    float shapeSeed = hash1(vec2(fi * 2.17, 8.42));
+    int shapeId = shapeSeed < 0.3333 ? 0 : (shapeSeed < 0.6666 ? 1 : 2);
 
     float t = fract(time * baseSpeed * (0.6 + seed2 * 0.8) + seed1);
 
-    float fallX = seed3 * aspect
-                  + direction.x * t * 0.5 * tiling
-                  + sin(t * 6.28 * (1.0 + seed4) + seed1 * 6.28) * 0.04 * tiling;
-    float fallY = 1.0 - t + direction.y * t * 0.3 * tiling;
+    // Travel axis = direction the leaves move. Screen Y increases downward, so the
+    // y component is negated to match the on-screen arrow (up arrow -> moves up).
+    // Default (down arrow = {0,-1}) reproduces the original top->bottom fall.
+    vec2 travelDir = normalize(vec2(direction.x, -direction.y) + vec2(0.0, 0.00001));
+    vec2 spawnAxis = vec2(-travelDir.y, travelDir.x);
+
+    // Path: leaf travels along travelDir from one edge to the opposite as t goes
+    // 0->1. pos = center + travelDir*(t-0.5)*extent makes the leaf MOVE toward the
+    // arrow direction (start behind center, end ahead). The cross-axis scatter
+    // spans enough to cover the screen regardless of travel orientation.
+    float spread = 1.3 * (abs(spawnAxis.x) * aspect + abs(spawnAxis.y) * 1.0);
+    float across = (seed3 - 0.5) * spread;
+    float travelExtent = abs(travelDir.x) * aspect + abs(travelDir.y) * 1.0 + 0.4;
+    float along  = (t - 0.5) * travelExtent;           // moves toward arrow dir
+    vec2 center  = vec2(0.5 * aspect, 0.5);
+    vec2 pos = center + travelDir * along + spawnAxis * across;
+
+    // Preserve the original gentle sway (perpendicular wobble) and spin verbatim.
+    pos += spawnAxis * sin(t * 6.28 * (1.0 + seed4) + seed1 * 6.28) * 0.04;
+
+    float fallX = pos.x;
+    float fallY = pos.y;
 
     float angle = t * 6.28 * 2.0 * (seed2 > 0.5 ? 1.0 : -1.0) + seed3 * 6.28;
 
+    // Count: density (0..1) controls how many of the 64 leaves are visible. Each
+    // leaf has a stable threshold (gateSeed, independent of colour); it fades in as
+    // density passes it, so the count slider scales visible leaves from a few up to
+    // all 64 while keeping a colour mix at every count.
+    float countGate = smoothstep(gateSeed - 0.08, gateSeed + 0.08, density);
+
+    // Depth: leaf shrinks as it travels its path (t 0->1), as if falling away from
+    // the camera toward the ground. Starts full, ends at ~45% size.
+    float depth = mix(1.0, 0.45, t);
+
     // Default size is ~0.3x of original — much smaller baseline
-    float leafSz = (0.004 + seed4 * 0.006) * particleSize * tiling;
+    float leafSz = (0.004 + seed4 * 0.006) * particleSize * (gridScale * 19.2) * depth;
 
     vec2 toLeaf = uv - vec2(fallX, fallY);
     float ca = cos(angle), sa = sin(angle);
@@ -273,8 +502,11 @@ half4 main(float2 coord) {
 
     float fade = smoothstep(0.0, 0.1, t) * smoothstep(1.0, 0.85, t);
 
-    float d = leafSDF(localP, leafSz);
-    float a = (1.0 - smoothstep(0.0, leafSz * 0.3, d)) * fade;
+    // Maple's lobed silhouette has less area, so nudge its size up a touch so the
+    // three shapes read at roughly the same visual scale in the mix.
+    float shapeSz = leafSz * (shapeId == 1 ? 1.15 : 1.0);
+    float d = leafSDF(localP, shapeSz, shapeId);
+    float a = (1.0 - smoothstep(0.0, shapeSz * 0.3, d)) * fade * countGate;
 
     vec3 c = pickColor(seed1);
     col += c * a;
@@ -284,6 +516,18 @@ half4 main(float2 coord) {
   return vec4(col, min(alpha, 1.0));
 }`;
 
+// ── Overhead clouds ───────────────────────────────────────────────────────────
+// Soft drifting cloud cover, tuned to match Owlbear's native cloud plugin while
+// adding our colour customization. Uses the native cloud() domain-warped FBM
+// (identical math) with four layers. Differences from native:
+//   - Layer activation: native hard-toggles layers at density 1/2/3; we soften
+//     those into smoothstep fades so our count slider sweeps continuously. The
+//     density range (~0.7..4.2 via CALIBRATION.cloud) matches native button 1..4.
+//   - Colour: native is flat white; we spread the 3-colour palette across the
+//     layers, composited PREMULTIPLIED so clouds add light over the terrain rather
+//     than grey-multiplying it (a pale palette lightens; a dark one reads as storm).
+//   - Size: native has no puff-size control; our size slider scales layer tiling.
+// No opacity ceiling (matches native density exactly).
 const SHADER_CLOUD = UNIFORMS_HEADER + UTIL_FBM + COLOR_PICKER + `
 float cloud(vec2 p, float spd, float animSpeed, float innerAnimSpeed, float detail) {
   vec2 anim = direction * time * spd * vec2(-1.0, 1.0) * animSpeed;
@@ -297,66 +541,511 @@ half4 main(float2 coord) {
   p = 0.5 + 0.5 * p;
   float baseSpeed = pow(speed - 0.5, 1.5);
   float tiling = max(size.x, size.y) / 150.0 / 20.0;
-  float alpha = 0.0;
+
+  // PUFF SCALE: particleSize scales all four layers' tiling together so puff size
+  // changes uniformly without breaking the layered look. Bigger size -> smaller
+  // frequency multipliers -> larger, fewer puffs; smaller -> finer puffs. A partial
+  // exponent keeps the slider extremes (0.3..3.0) usable rather than degenerate.
+  float puff = pow(clamp(particleSize, 0.3, 3.0), 0.6);
+  float t = tiling / puff;
+
+  // ---- Density accumulation with per-layer colour. Native uses flat white; we
+  // sample the palette across the four layers (like the baseline did) so cores and
+  // edges can differ, then composite PREMULTIPLIED so it adds light over the terrain
+  // instead of grey-multiplying it. Each layer adds (its alpha) to the total alpha
+  // and (its alpha * its colour) to the colour sum; dividing isn't needed because
+  // premultiplied output IS the alpha-weighted colour sum. ----
+  float w2 = smoothstep(0.6, 1.4, density);   // layer 2 fades in around density 1
+  float w3 = smoothstep(1.6, 2.4, density);   // layer 3 around density 2
+  float w4 = smoothstep(2.6, 3.4, density);   // layer 4 around density 3
+
+  float a1 = cloud(p * 3.0 * t, baseSpeed * 0.3 + 0.25, 0.2, 0.1, 0.5) * 0.8;
+  float a2 = cloud(p * 5.0 * t, baseSpeed * 0.3 + 0.25, 0.4, 0.1, 0.8) * 0.5 * w2;
+  float a3 = cloud(p * 2.0 * t, baseSpeed * 0.3 + 0.25, 0.1, 0.1, 0.3) * 0.5 * w3;
+  float a4 = cloud(p * 1.2 * t, baseSpeed * 0.3 + 0.25, 0.05, 0.1, 0.2) * 0.5 * w4;
+
+  float alpha = clamp(a1 + a2 + a3 + a4, 0.0, 1.5);
+
+  // Palette spread across cloud depth. pickColor is a 3-colour picker
+  // (seed <0.333 -> color1, <0.666 -> color2, else color3), so these seeds are
+  // chosen to land on distinct colours: base body = color1, mid = color2,
+  // detail = color3, finest loops back to color1.
+  vec3 colSum = pickColor(0.10) * a1
+              + pickColor(0.50) * a2
+              + pickColor(0.80) * a3
+              + pickColor(0.10) * a4;
+
+  // ---- Blend: premultiplied, no opacity ceiling — matches the native plugin's
+  // density exactly (their clamp was 0..1.5 with no cap). colSum is already
+  // alpha-weighted, so it IS the premultiplied RGB; alpha is the accumulated cover.
+  return vec4(colSum, alpha);
+}`;
+
+// ── Roiling fog ───────────────────────────────────────────────────────────────
+// Built from Owlbear's native SAND shader (same domain-warped FBM warp engine as
+// cloud, but sand's layer tunings: faster inner animation, denser low layers — that
+// churning, rolling quality). Recoloured with our 3-colour palette and composited
+// PREMULTIPLIED like cloud, so fog adds light/colour over terrain instead of
+// grey-multiplying it.
+//
+// Designed to span a WIDE range from one effect (per the brief):
+//   - DEFAULT sits at slow + thick "heavy roiling ground fog".
+//   - High speed + high count reaches the native sand effect's racing, dense feel.
+//   - Small size raises contrast -> thin, stringy, wispy TENDRILS with clear gaps.
+//   - Large size -> broad soft fog banks.
+// Slider mapping in CALIBRATION.fog spreads the defaults/ranges accordingly.
+//
+// WISP: small particleSize sharpens the alpha falloff (stringy tendrils); large
+// size softens it (full banks). This is what turns "thick fog" into "tendrils"
+// without needing a 4th slider.
+const SHADER_FOG = UNIFORMS_HEADER + UTIL_FBM + COLOR_PICKER + `
+float fogField(vec2 p, float spd, float animSpeed, float innerAnimSpeed, float detail) {
+  vec2 anim = direction * time * spd * vec2(-1.0, 1.0) * animSpeed;
+  vec2 innerP = p + anim * innerAnimSpeed;
+  vec2 q = vec2(fbm4(innerP), fbm4(innerP + vec2(5.452)));
+  return clamp(fbm6(p + anim + q * detail), 0.0, 1.0);
+}
+half4 main(float2 coord) {
+  vec2 p = coord / size;
+  p.x *= size.x / size.y;
+  p = 0.5 + 0.5 * p;
+
+  // Sand uses a higher speed floor (+0.5) than cloud (+0.25); we lower it so fog
+  // CAN sit nearly still and roil in place at low speed, but still reach sand's
+  // pace at high speed.
+  float baseSpeed = pow(speed - 0.5, 1.5);
+  float animBase = baseSpeed * 0.3 + 0.2;
+  float tiling = max(size.x, size.y) / 150.0 / 20.0;
+
+  // TENDRIL SCALE: bigger size -> larger, broader fog masses; smaller -> finer wisps.
+  float scl = pow(clamp(particleSize, 0.3, 3.0), 0.6);
+  float t = tiling / scl;
+
+  // Layer fades aligned to density 1/2/3 (calibration maps count to ~0.8..4.2), same
+  // continuous-sweep approach as cloud. Sand's layer tilings: 3.0 / 5.0 / 1.0 / 0.5
+  // (note the big low-freq layers — that's the rolling-bank character).
+  float w2 = smoothstep(0.6, 1.4, density);
+  float w3 = smoothstep(1.6, 2.4, density);
+  float w4 = smoothstep(2.6, 3.4, density);
+
+  float a1 = fogField(p * 3.0 * t, animBase, 0.5, 0.1, 0.5);
+  float a2 = fogField(p * 5.0 * t, animBase, 0.8, 0.1, 0.8) * w2;
+  float a3 = fogField(p * 1.0 * t, animBase, 0.4, 0.1, 0.3) * w3;
+  float a4 = fogField(p * 0.5 * t, animBase, 0.2, 0.1, 0.2) * w4;
+
+  float raw = a1 + a2 + a3 + a4;
+
+  // WISPINESS: small size sharpens the falloff so fog breaks into stringy tendrils
+  // with clear gaps; large size keeps it soft and full. Map size 0.3..3.0 -> a
+  // smoothstep window that tightens (high contrast) when small, widens (soft) when big.
+  float wisp = clamp(1.0 - (particleSize - 0.3) / 2.7, 0.0, 1.0); // 1 small .. 0 large
+  float lo = mix(0.0, 0.55, wisp);     // tendrils cut low density away
+  float hi = mix(1.5, 1.05, wisp);     // and need more to reach full
+  float alpha = smoothstep(lo, hi, raw) * 1.5;
+  // Fixed 90% opacity ceiling: no pixel may reach full opaque, so the map always
+  // ghosts through even under the densest roiling cores. Applied as a true ceiling
+  // on final alpha (not a uniform scale), so thin areas are untouched and only the
+  // peaks are pulled back to 0.90.
+  alpha = min(alpha, 0.90);
+
+  // Palette spread across fog depth (3-colour picker; seeds land on distinct colours).
+  vec3 colSum = pickColor(0.10) * a1
+              + pickColor(0.50) * a2
+              + pickColor(0.80) * a3
+              + pickColor(0.10) * a4;
+  // Renormalise colour to the shaped alpha so the tint stays correct after the
+  // wispiness curve reshapes total density (avoids colour washing out in tendrils).
+  float rawSum = max(raw, 0.001);
+  vec3 fogCol = (colSum / rawSum) * alpha;   // premultiplied by shaped alpha
+
+  return vec4(fogCol, alpha);
+}`;
+
+// ── Floating dust / motes ─────────────────────────────────────────────────────
+// Slow ambient specks that WANDER and hang in the air (Brownian-ish drift), unlike
+// any existing effect: embers rise purposefully, snow falls, fireflies pulse-glow.
+// Dust just floats aimlessly and TWINKLES as motes catch the light. Three things
+// give it its identity:
+//   1. Aimless drift — each mote follows two slow out-of-phase sine paths (x and y)
+//      so it meanders and pauses rather than travelling edge-to-edge.
+//   2. Parallax depth — motes split into near/far tiers (size + brightness) so it
+//      reads as a 3D volume of air, not a flat sheet.
+//   3. Twinkle — a per-mote brightness flicker (rotating speck catching light).
+// Direction is INERT for dust (it wanders); the menu greys it out.
+const SHADER_DUST = UNIFORMS_HEADER + COLOR_PICKER + `
+half4 main(float2 coord) {
+  vec2 uv = coord / size;
+  uv.x *= size.x / size.y;
+  float aspect = size.x / size.y;
+  // GRID-RELATIVE size (see bloom): keeps mote size constant regardless of shape size.
+  float gridScale = gridDpi / size.y;     // uv-y units per grid square
+  float drift = max(speed * 0.05, 0.01);
+
   vec3 col = vec3(0.0);
-  float a1 = cloud(p * 3.0 * tiling, baseSpeed * 0.3 + 0.25, 0.2, 0.1, 0.5) * 0.8;
-  col += pickColor(0.1) * a1; alpha += a1;
-  if (density > 1.0) { float a2 = cloud(p * 5.0 * tiling, baseSpeed * 0.3 + 0.25, 0.4, 0.1, 0.8) * 0.5; col += pickColor(0.5) * a2; alpha += a2; }
-  if (density > 2.0) { float a3 = cloud(p * 2.0 * tiling, baseSpeed * 0.3 + 0.25, 0.1, 0.1, 0.3) * 0.5; col += pickColor(0.8) * a3; alpha += a3; }
-  if (density > 3.0) { float a4 = cloud(p * 1.2 * tiling, baseSpeed * 0.3 + 0.25, 0.05, 0.1, 0.2) * 0.5; col += pickColor(0.3) * a4; alpha += a4; }
-  return vec4(col, clamp(alpha, 0.0, 1.5));
+  float alpha = 0.0;
+
+  for (int i = 0; i < 200; i++) {
+    float fi = float(i);
+    float s1 = hash1(vec2(fi * 1.23, 4.56));   // colour seed
+    float s2 = hash1(vec2(fi * 7.89, 2.34));   // path phase / speed
+    float s3 = hash1(vec2(fi * 3.21, 9.87));   // home position
+    float s4 = hash1(vec2(fi * 5.67, 1.45));   // size / twinkle
+    float gateSeed = hash1(vec2(fi * 4.32, 12.8));
+    float yseed = hash1(vec2(fi * 8.11, 3.77));
+
+    // Home position scattered across the screen; motes wander AROUND it, not across.
+    vec2 home = vec2(s3 * aspect, yseed);
+    // Two slow out-of-phase sines per axis -> lazy meander that pauses and reverses.
+    float tx = time * drift * (0.5 + s2 * 0.6);
+    float ty = time * drift * (0.4 + s4 * 0.6);
+    vec2 wander = vec2(
+      sin(tx + s1 * 6.28) * 0.06 + sin(tx * 0.37 + s4 * 6.28) * 0.03,
+      cos(ty + s3 * 6.28) * 0.05 + cos(ty * 0.41 + s2 * 6.28) * 0.025
+    );
+    vec2 pos = home + wander;
+
+    // Parallax: split into far (small/faint) and near (larger/brighter) tiers.
+    float near = step(0.6, s4);                 // ~40% near, ~60% far
+    float baseSz = mix(0.0018, 0.0048, s4) * particleSize * (gridScale * 19.2);
+    // Brightness floor lifted so motes read on light maps too, not just dark ones.
+    float baseBright = mix(0.6, 1.3, near * 0.6 + s2 * 0.4);
+
+    // Count gate: density scales how many motes are visible.
+    float countGate = smoothstep(gateSeed - 0.08, gateSeed + 0.08, density);
+
+    // Twinkle: brightness flickers as the mote 'rotates' and catches light. Floor
+    // kept fairly high so motes never fully vanish (stays visible, just pulses).
+    float tw = 0.7 + 0.3 * sin(time * (0.8 + s4 * 1.6) + s1 * 6.28);
+
+    float d = length(uv - pos);
+    float speck = 1.0 - smoothstep(0.0, baseSz, d);   // soft round mote
+    float a = speck * baseBright * tw * countGate;
+
+    col += pickColor(s1) * a;
+    alpha += a;
+  }
+
+  return vec4(col, min(alpha, 1.0));
+}`;
+
+// ── Rising bubbles (top-down water) ───────────────────────────────────────────
+// Bubbles surfacing in water, viewed TOP-DOWN orthographic (camera looks straight
+// down at the surface). Critically, "rising" is motion TOWARD THE CAMERA along the
+// Z axis — NOT travel across the screen. Same lesson as top-down rain: depth motion
+// is rendered as SCALING, not translation. So each bubble:
+//   - Stays at a fixed (x,y) point on the surface (only a small wobble jitters it).
+//   - Starts SMALL + faint (deep, far from camera) and GROWS + brightens as it rises.
+//   - Ends either as a SURFACE POP (brief expand-and-thin burst) or a gentler
+//     mid-rise fade — a per-bubble mix so they don't all burst in unison.
+// Direction is INERT (up is intrinsic to rising); the menu greys it out.
+const SHADER_BUBBLES = UNIFORMS_HEADER + COLOR_PICKER + `
+half4 main(float2 coord) {
+  vec2 uv = coord / size;
+  uv.x *= size.x / size.y;
+  float aspect = size.x / size.y;
+  // GRID-RELATIVE size (see bloom): keeps bubble size constant regardless of shape size.
+  float gridScale = gridDpi / size.y;     // uv-y units per grid square
+  float rate = max(speed * 0.18, 0.03);
+
+  vec3 col = vec3(0.0);
+  float alpha = 0.0;
+
+  for (int i = 0; i < 90; i++) {
+    float fi = float(i);
+    float s1 = hash1(vec2(fi * 1.41, 6.18));   // colour
+    float s2 = hash1(vec2(fi * 9.27, 3.14));   // max size (drives rise rate)
+    float s3 = hash1(vec2(fi * 2.72, 8.31));   // x position
+    float s4 = hash1(vec2(fi * 4.95, 1.62));   // y position
+    float s5 = hash1(vec2(fi * 6.33, 9.04));   // wobble phase/amount
+    float gateSeed = hash1(vec2(fi * 5.55, 11.3));
+    float popSeed  = hash1(vec2(fi * 7.42, 2.91));  // surface-pop vs mid-fade
+
+    // Fixed surface point for this bubble (stays put; only wobbles).
+    vec2 home = vec2(s3 * aspect, s4);
+
+    // Rise cycle 0..1. Bigger bubbles (s2) rise a touch faster.
+    float spd = rate * (0.7 + s2 * 0.7);
+    float t = fract(time * spd + s1);
+
+    // Does this bubble surface-pop, or fade mid-rise? ~55% pop, ~45% fade.
+    float pops = step(0.45, popSeed);
+    // riseEnd: pops travel the full column (t up to ~0.92 then burst); faders peak
+    // partway (0.45..0.8) and dissolve, never reaching the surface.
+    float riseEnd = mix(mix(0.45, 0.8, s4), 0.92, pops);
+
+    // Normalised progress up to this bubble's end point.
+    float prog = clamp(t / riseEnd, 0.0, 1.0);
+
+    // SCALE toward camera: small when deep (prog 0), large near surface (prog 1).
+    float grow = mix(0.25, 1.0, prog);
+    float maxSz = mix(0.007, 0.020, s2) * particleSize * (gridScale * 19.2);
+    float bubSz = maxSz * grow;
+
+    // Wobble: tiny in-place jitter, a bit more as it nears the surface.
+    vec2 wob = vec2(
+      sin(t * 6.28 * (1.2 + s5 * 1.5) + s5 * 6.28),
+      cos(t * 6.28 * (1.0 + s5 * 1.3) + s3 * 6.28)
+    ) * 0.012 * (0.4 + prog) * particleSize;
+    vec2 pos = home + wob;
+
+    // Brightness rises with depth-progress (deep = faint, near = sharp).
+    float depthBright = mix(0.25, 1.0, prog);
+
+    // POP: in the last slice of a popping bubble's rise, the ring blows out larger
+    // and thins, then the whole thing fades — a surface burst.
+    float popPhase = smoothstep(0.85, 1.0, t) * pops;      // 0 until near top, ramps to 1
+    float burst = 1.0 + popPhase * 1.8;                     // ring expands during burst
+    float popFade = 1.0 - popPhase;                         // and fades out
+
+    // Spawn fade-in (small/faint emerging) and end fade.
+    float birth = smoothstep(0.0, 0.06, t);
+    float death = pops > 0.5 ? popFade : (1.0 - smoothstep(riseEnd - 0.12, riseEnd, t));
+    float life = birth * death;
+
+    float countGate = smoothstep(gateSeed - 0.08, gateSeed + 0.08, density);
+
+    float rSz = bubSz * burst;
+    float d = length(uv - pos);
+    // RING: hollow annulus. Thins as it bursts (rim gets sharper/fainter).
+    float ringThin = mix(0.6, 0.78, popPhase);
+    float ring = smoothstep(rSz * ringThin, rSz * 0.9, d) * (1.0 - smoothstep(rSz * 0.9, rSz * 1.12, d));
+    // HIGHLIGHT spot, upper-left; suppressed during burst (surface broken).
+    vec2 hlOff = vec2(-bubSz * 0.32, -bubSz * 0.32);
+    float hl = (1.0 - smoothstep(0.0, bubSz * 0.26, length(uv - pos - hlOff))) * (1.0 - popPhase);
+    // Faint interior sheen for translucency.
+    float fill = (1.0 - smoothstep(0.0, rSz * 0.9, d)) * 0.10 * (1.0 - popPhase);
+
+    float body = (ring * 0.95 + hl * 0.85 + fill) * life * depthBright * countGate;
+    col += pickColor(s1) * body;
+    alpha += body;
+  }
+
+  return vec4(col, min(alpha, 1.0));
 }`;
 
 const SHADER_FIREFLIES = UNIFORMS_HEADER + UTIL_CIRCLE + COLOR_PICKER + `
+// Like animatedCircle, but also returns the STABLE integer cell id of the winning
+// firefly (cellId). The wandering point moves every frame, so species/flash phase
+// must key off cellId (which never changes) — not off the moving point, or every
+// frame samples a different random phase and it averages into fast shimmer.
+void fireflyCell(vec2 p, float jitter, float spd, inout float minDist, inout vec2 cellId) {
+  vec2 tileInt = floor(p); vec2 tileFrac = fract(p);
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec2 neighbor = vec2(float(i), float(j));
+      vec2 cell = tileInt + neighbor;
+      vec2 point = hash2(cell);
+      point = 0.5 + 0.5 * sin(time * spd + jitter * point);
+      vec2 diff = neighbor + point - tileFrac;
+      float dist = length(diff);
+      if (dist < minDist) { minDist = dist; cellId = cell; }
+    }
+  }
+}
+
+// Flash envelope: returns 0..1 brightness for a firefly, emulating real species
+// flash timing (Great Smoky Mtns NPS reference). Fireflies are DARK most of the
+// time, then flash — that dark gap is what makes them read as fireflies, not throb.
+// species: 0 pyralis (single sustained), 1 macdermotti (double), 2 carolinus
+// (synchronous 6-flash burst), 3 brimleyi (sparse single), 4 photuris (sharp
+// flashbulb), 5 blue-ghost (steady glow). h = per-firefly random (0..1). rate
+// scales overall tempo (speed slider).
+float flashEnvelope(int species, float h, float t, float rate) {
+  // per-firefly time offset so non-synchronous species don't flash together
+  float off = h * 10.0;
+
+  if (species == 5) {
+    // blue ghost: steady soft glow, gently breathing
+    return 0.45 + 0.15 * sin(t * rate * 0.8 + off);
+  }
+  if (species == 2) {
+    // carolinus synchronous: SAME phase for all (no offset) -> they sync.
+    // 6 rapid flashes packed into first part of a ~ (period) cycle, then dark.
+    float period = 9.0 / rate;          // ~8-10s including dark gap
+    float ph = fract(t / period);       // no per-firefly offset = synchronous
+    float burst = 0.0;
+    if (ph < 0.42) {
+      // 6 flashes across the burst window
+      float fp = ph / 0.42 * 6.0;       // 0..6
+      float frac = fract(fp);
+      burst = smoothstep(0.0, 0.18, frac) * smoothstep(0.55, 0.30, frac);
+    }
+    return burst;
+  }
+  if (species == 1) {
+    // macdermotti double-flash: two pulses ~1.5-2s apart, then 4-5s pause
+    float period = 7.0 / rate;
+    float ph = fract(t / period + off);
+    float f1 = smoothstep(0.0, 0.03, ph) * smoothstep(0.12, 0.06, ph);
+    float f2 = smoothstep(0.20, 0.23, ph) * smoothstep(0.32, 0.26, ph);
+    return max(f1, f2);
+  }
+  if (species == 4) {
+    // photuris sharp flashbulb: very short bright spike, longish gap
+    float period = 5.0 / rate;
+    float ph = fract(t / period + off);
+    return smoothstep(0.0, 0.015, ph) * smoothstep(0.10, 0.03, ph);
+  }
+  if (species == 3) {
+    // brimleyi sparse single: one flash every 10s+ (rare)
+    float period = 12.0 / rate;
+    float ph = fract(t / period + off);
+    return smoothstep(0.0, 0.04, ph) * smoothstep(0.18, 0.08, ph);
+  }
+  // pyralis single sustained (default): one ~0.5s glow per ~3-4s cycle
+  float period = 4.0 / rate;
+  float ph = fract(t / period + off);
+  return smoothstep(0.0, 0.06, ph) * smoothstep(0.40, 0.18, ph);
+}
+
+float fireflyLayer(vec2 p, float jitter, float wanderSpd, float sz, float blur, float rate) {
+  float minDist = 10.0; vec2 cellId = vec2(0.0);
+  fireflyCell(p, jitter, wanderSpd, minDist, cellId);
+  // species + phase keyed off the STABLE cell id (not the wandering point)
+  float h = hash1(cellId);
+  int species =
+      h < 0.34 ? 0 :   // pyralis (common)
+      h < 0.55 ? 1 :   // macdermotti
+      h < 0.72 ? 2 :   // carolinus synchronous
+      h < 0.84 ? 3 :   // brimleyi sparse
+      h < 0.94 ? 4 :   // photuris flashbulb
+                 5;    // blue ghost steady
+  // disc: minDist is distance (in tiled units) to the firefly point. Light a small
+  // round dot. The original effective radius was ~sz*0.16; matching that keeps the
+  // dots small. (A radius of sz*1.2 made them ~5-7x too big.)
+  float radius = sz * 0.18;
+  float edge = sz * 0.22;
+  float disc = 1.0 - smoothstep(radius - edge, radius + edge, minDist);
+  float glow = flashEnvelope(species, hash1(cellId + vec2(3.1, 7.7)), time, rate);
+  return disc * glow;
+}
+
 half4 main(float2 coord) {
   vec2 p = coord / size;
   p.x *= size.x / size.y;
-  float baseSpeed = pow(speed - 0.5, 1.5) * 0.3;
+  // Faster baseline: ~20% quicker at slider 1.0 than before, with a real floor.
+  float rate = (0.45 + 0.95 * speed) * 1.2;
   float tiling = max(size.x, size.y) / 150.0 / 20.0;
   float sz = 0.04 * particleSize;
-  float alpha = 0.0; vec3 col = vec3(0.0);
-  // Fireflies: slow wandering circles with pulsing glow
-  float minDist = 10.; vec2 minPoint;
-  animatedCircle(p * 4.0 * tiling, 3.0, baseSpeed * 0.5, minDist, minPoint);
-  float scale = dot(minPoint, vec2(0.4, 0.4)) - 0.2 - sz;
-  float blur = sz * 0.4;
-  float pulse = 0.5 + 0.5 * sin(time * (1.0 + hash1(minPoint) * 2.0));
-  float a1 = (1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist)) * pulse;
-  col += pickColor(hash1(minPoint)) * a1; alpha += a1;
-  float minDist2 = 10.; vec2 minPoint2;
-  animatedCircle(p * 6.0 * tiling * density * 0.4, 5.0, baseSpeed * 0.7, minDist2, minPoint2);
-  float scale2 = dot(minPoint2, vec2(0.4, 0.4)) - 0.2 - sz * 0.6;
-  float pulse2 = 0.5 + 0.5 * sin(time * (2.0 + hash1(minPoint2) * 3.0) + 1.57);
-  float a2 = (1.0 - smoothstep(sz * 0.6 * scale2 - blur, sz * 0.6 * scale2 + blur, minDist2)) * pulse2;
-  col += pickColor(hash1(minPoint2)) * a2; alpha += a2;
-  return vec4(col, min(alpha, 1.0) * 0.9);
+  float blur = sz * 0.5;
+
+  // Count via layer weights (embers lesson): the ALWAYS-ON base is a MID-density
+  // layer; sparser-spaced (bigger) and denser (smaller/more) layers fade in around
+  // it so low count shows a few mid flies and high count genuinely fills in.
+  float d = clamp(density, 0.0, 1.0);
+  float wMid = mix(0.5, 1.0, smoothstep(0.0, 0.5, d)); // 6x — always on
+  float wHi  = smoothstep(0.10, 0.55, d);              // 10x — more, smaller flies
+  float wHi2 = smoothstep(0.45, 1.0, d);               // 15x — densest fill
+
+  vec3 col = vec3(0.0);
+  float gMid = fireflyLayer(p * 6.0  * tiling, 4.0, rate * 0.18, sz,       blur, rate) * wMid;
+  float gHi  = fireflyLayer(p * 10.0 * tiling, 6.0, rate * 0.22, sz * 0.8, blur, rate) * wHi;
+  float gHi2 = fireflyLayer(p * 15.0 * tiling, 8.0, rate * 0.26, sz * 0.7, blur, rate) * wHi2;
+
+  // Subtle luminance lift: scale the lit colour up a touch so flashes read brighter
+  // without enlarging the dots, and lift the alpha cap slightly.
+  float lift = 1.3;
+  col += pickColor(0.15) * gMid * lift;
+  col += pickColor(0.5)  * gHi  * lift;
+  col += pickColor(0.85) * gHi2 * lift;
+  float a = gMid + gHi + gHi2;
+
+  return vec4(col, min(a * 1.15, 1.0));
 }`;
 
-const SHADER_MAGIC = UNIFORMS_HEADER + UTIL_LINE + COLOR_PICKER + `
+// ── Orthographic / top-down rain ──────────────────────────────────────────────
+// Camera points straight down at the ground. A drop falling vertically projects to
+// screen radius r/h from centre; as it falls h shrinks so the drop moves OUTWARD
+// from the centre toward the edge, growing and speeding up. Each drop has a fixed
+// angle from centre and a looping phase driving it out along that ray.
+const SHADER_TOPRAIN = UNIFORMS_HEADER + UTIL_FBM + COLOR_PICKER + `
+// distance from point p to a segment a-b
+float segDist(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h);
+}
 half4 main(float2 coord) {
-  vec2 p = coord / size;
-  p.x *= size.x / size.y;
-  float baseSpeed = pow(speed - 0.5, 2.0) * 0.5 + 0.2;
-  float tiling = max(size.x, size.y) / 150.0 / 20.0;
-  float sz = 0.008 * particleSize;
-  vec4 color = vec4(0.0);
-  // Magic: rising spiraling sparks using line primitives at spiral angles
-  float minDist = 10.; vec2 minPoint;
-  animatedLine(p * 10.0 * tiling, 1.5, 0.3 + baseSpeed * 0.3, baseSpeed + 0.5, vec2(direction.x * 0.3, 1.0), minDist, minPoint);
-  float scale = dot(minPoint, vec2(0.8, 0.8));
-  float blur = sz * 2.0;
-  float line1 = 1.0 - smoothstep(sz * scale - blur, sz * scale + blur, minDist);
-  vec3 c1 = pickColor(hash1(minPoint));
-  color += vec4(c1 * line1, line1);
-  if (density > 1.0) {
-    float minDist2 = 10.; vec2 minPoint2;
-    animatedLine(p * 20.0 * tiling, 2.5, 0.5 + baseSpeed * 0.4, baseSpeed + 1.0, vec2(direction.x * 0.2, 0.8), minDist2, minPoint2);
-    float scale2 = dot(minPoint2, vec2(0.8, 0.8));
-    float line2 = 1.0 - smoothstep(sz * 0.7 * scale2 - blur, sz * 0.7 * scale2 + blur, minDist2);
-    vec3 c2 = pickColor(hash1(minPoint2));
-    color += vec4(c2 * line2 * 1.5, line2);
+  vec2 uv = coord / size;
+  float aspect = size.x / size.y;
+  vec2 cen = vec2(0.5 * aspect, 0.5);
+  vec2 P = vec2(uv.x * aspect, uv.y);
+
+  // Speed: 1x feels like the old 2x (rebased so speed 1.0 ~ old 2x rate ~1.3).
+  float baseSpeed = pow(speed + 1.0, 2.0) * 0.55 + 0.3;
+  float maxR = 0.75 * max(aspect, 1.0);     // how far out drops travel
+  vec3 col = vec3(0.0); float alpha = 0.0;
+
+  // ---- falling drops: spawn ANYWHERE (edge to interior) and track inward, each
+  // stopping at its own target depth so the whole frame — including the middle —
+  // stays populated. Drops keep varied inward angles based on spawn position. ----
+  int count = int(24.0 + density * 80.0);      // density 0..1 -> ~24..104 drops
+  for (int i = 0; i < 110; i++) {
+    if (i >= count) break;
+    float fi = float(i);
+    float ang = hash1(vec2(fi * 1.7, 3.1)) * 6.2832;       // spawn angle from centre
+    // spawn radius spans the WHOLE frame (0.1..1.0 of maxR) so some drops start
+    // near the centre and some near the edge — no perpetually-empty middle.
+    float spawnR = (0.10 + hash1(vec2(fi * 4.4, 2.2)) * 0.90) * maxR;
+    float spdJ = 0.7 + hash1(vec2(fi * 2.3, 8.9)) * 0.6;   // per-drop speed jitter
+    float ph = fract(time * baseSpeed * 0.50 * spdJ + hash1(vec2(fi * 5.1, 1.3)));
+
+    vec2 dir = vec2(cos(ang), sin(ang));        // direction from centre to spawn
+    // each drop travels inward a fraction of its spawn radius toward centre, with
+    // a per-drop target depth: some stop near the zone, some go deeper toward centre.
+    float depth = 0.35 + hash1(vec2(fi * 7.7, 4.9)) * 0.55;  // 0.35..0.90 of the way in
+    float endR = max(spawnR * (1.0 - depth), 0.02);
+
+    // travel inward: radius goes spawnR -> endR as ph 0->1 (ease for accel inward)
+    float r = mix(spawnR, endR, ph * ph);
+    vec2 pos = cen + dir * r;
+
+    // streak along travel (inward), shrinking as it nears its endpoint. Much smaller
+    // default size than before.
+    float taper = 0.3 + 0.7 * clamp((r - endR) / max(spawnR - endR, 0.001), 0.0, 1.0);
+    float streak = (0.002 + 0.008 * taper) * (0.5 + particleSize * 0.6);
+    float width = (0.0004 + 0.0008 * taper) * (0.5 + particleSize * 0.6);
+    vec2 tail = pos + dir * streak;             // tail trails OUTWARD behind inward motion
+    float dseg = segDist(P, tail, pos);
+
+    float fade = smoothstep(0.0, 0.10, ph) * smoothstep(1.0, 0.80, ph);
+    float drop = (1.0 - smoothstep(width, width * 2.2, dseg)) * fade;
+
+    vec3 dc = pickColor(hash1(vec2(fi * 3.7, 6.2)));
+    col += dc * drop; alpha += drop;
   }
-  return color;
+
+  // ---- random ground splashes (not tied to drops): round expanding rings, with
+  // a few flying droplets on some of them. Always present at constant low opacity;
+  // density controls HOW MANY splash, not how bright. ----
+  {
+    vec2 g = vec2(13.0 * aspect, 13.0);          // finer grid = smaller splashes
+    vec2 cell = floor(P * g);
+    vec2 f = fract(P * g);
+    float seed = hash1(cell + 0.5);
+    float seed2 = hash1(cell + vec2(2.7, 9.1));
+    float period = 1.0 + seed * 2.0;
+    float cyc = floor(time * baseSpeed * 0.6 / period + seed2);  // which splash cycle
+    float sp = fract(time * baseSpeed * 0.6 / period + seed2);   // phase within cycle
+
+    // aspect-correct the local coord so the ring is ROUND, not an oval. f spans a
+    // square cell, but screen x was scaled by aspect, so undo it on the x axis.
+    vec2 fc = (f - 0.5) * vec2(1.0 / aspect, 1.0);
+    float d2 = length(fc);
+
+    float ringR = sp * 0.16;
+    float ring = (1.0 - smoothstep(0.012, 0.03, abs(d2 - ringR))) *
+                 smoothstep(0.0, 0.1, sp) * smoothstep(0.55, 0.30, sp);
+
+    // density raises the fraction of cells allowed to splash (~30% min -> ~75% max)
+    float allow = mix(0.70, 0.25, clamp(density, 0.0, 1.0));
+    float gate = step(allow, hash1(cell + cyc));
+
+    float splash = ring * gate * 0.28;           // constant low opacity
+    col += pickColor(0.7) * splash; alpha += splash;
+  }
+
+  return vec4(col, min(alpha, 1.0) * 0.7);
 }`;
 
 // ── Shader map ────────────────────────────────────────────────────────────────
@@ -367,13 +1056,23 @@ const SHADERS = {
   fireflies: SHADER_FIREFLIES,
   snow:      SHADER_SNOW,
   rain:      SHADER_RAIN,
-  magic:     SHADER_MAGIC,
+  toprain:   SHADER_TOPRAIN,
   cloud:     SHADER_CLOUD,
+  fog:       SHADER_FOG,
+  dust:      SHADER_DUST,
+  bubbles:   SHADER_BUBBLES,
 };
 
 // ── Active effects: mapItemId -> localEffectId ────────────────────────────────
 
 const activeEffects = new Map();
+
+// Grid DPI (pixels per grid square) — cached so the synchronous buildUniforms can
+// read it. OBR grids are a fixed real-world scale (default 150px/square) regardless
+// of map size, so sizing particles relative to this — instead of to the effect's
+// bounding box — keeps particle size CONSTANT across maps of any size or shape.
+// Fetched on scene-ready and kept updated if the grid changes.
+let gridDpi = 150;
 
 function hexToVec3(hex) {
   hex = hex.replace('#', '');
@@ -385,6 +1084,160 @@ function hexToVec3(hex) {
   };
 }
 
+// ── Per-effect calibration ────────────────────────────────────────────────────
+//
+// Each effect owns its own slider interpretation so tuning one cannot affect
+// another. `defaults` are the raw slider values applied when this effect is
+// selected (the menu mirrors these). `map(raw)` converts the raw slider values
+// { count, speed, size } into the three tunable uniforms { speed, density,
+// particleSize } that the shaders consume.
+//
+// NOTE: every map() below currently reproduces the original shared mapping
+// exactly (speed = raw.speed, density = raw.count/120*3, particleSize = raw.size),
+// so this change is visually identical to the previous version. Tune an effect by
+// editing ONLY its own row — no other effect can be affected.
+//
+// `count`: 20–400, `speed`: 0.2–3.0, `size`: 0.3–3.0  (slider ranges in menu.html)
+
+const IDENTITY_MAP = (raw) => ({
+  speed:        raw.speed,
+  density:      (raw.count / 120.0) * 3.0,
+  particleSize: raw.size,
+});
+
+const CALIBRATION = {
+  embers: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // SE start direction (down-right). Halve apparent size so 1x == old 0.5x.
+    // density (0..1) drives how many LAYERS are active in SHADER_EMBERS, so the
+    // count slider genuinely adds/removes embers. Map count 20–300 -> 0..1.
+    map: (raw) => ({
+      speed:        raw.speed,
+      density:      Math.min((raw.count - 20.0) / 280.0, 1.0),
+      particleSize: raw.size * 0.5,
+    }),
+  },
+  bloom: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // Leaf pool is 96 (see SHADER_BLOOM loop). density (0..1) gates the fraction
+    // shown. Curve: count 20 -> sparse (~4 leaves), default 120 -> ~33, max 400 ->
+    // ~95 (flurry). The exp 0.75 fills out the mid-range so middling counts feel
+    // fuller. Speed: 1x feels like old 0.6x, so raw speed is scaled by 0.6.
+    map: (raw) => {
+      const c = Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0); // 20–400 -> 0..1
+      const shaped = Math.pow(c, 0.75);                                   // fuller mids
+      return {
+        speed:        raw.speed * 0.6,
+        density:      0.04 + shaped * 0.96,
+        particleSize: raw.size,
+      };
+    },
+  },
+  fireflies: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // density 0..1 drives layer weights in SHADER_FIREFLIES (count = how many
+    // flies). Speed handled inside the shader (faster baseline). Size as-is.
+    map: (raw) => ({
+      speed:        raw.speed,
+      density:      Math.min((raw.count - 20.0) / 280.0, 1.0),
+      particleSize: raw.size,
+    }),
+  },
+  snow: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // density 0..1 across the FULL count slider (20..400) so flake quantity keeps
+    // varying the whole way. Base layers (all 3 sizes) always on; extra copies of
+    // each size fade in through low/mid; blizzard haze from ~mid; extreme white-out
+    // only at the very top (count 350+).
+    map: (raw) => ({
+      speed:        raw.speed,
+      density:      Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0),
+      particleSize: raw.size,
+    }),
+  },
+  rain: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    map: IDENTITY_MAP,
+  },
+  toprain: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // density 0..1 across full slider -> ~24..104 drops in SHADER_TOPRAIN.
+    map: (raw) => ({
+      speed:        raw.speed,
+      density:      Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0),
+      particleSize: raw.size,
+    }),
+  },
+  cloud: {
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    // Calibrated to match Owlbear's native cloud plugin range. Their "Cover" buttons
+    // emit density 1/2/3/4 (each toggles a cloud layer via density>1/2/3 in-shader),
+    // and their "Wind" buttons emit speed 1/2/3/4 into pow(speed-0.5,1.5). Our sliders
+    // must span those same uniform ranges or the top end feels dead.
+    //   count 20..400  -> density ~0.7..4.2  (low count ~ their btn1, max ~ their btn4)
+    //   speed 0.2..3.0 -> speed   ~1.0..4.0  (so pow() spread matches their btn1..btn4)
+    //   size           -> particleSize (puff scale; shader uses it for layer tiling)
+    map: (raw) => {
+      const c = Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0); // 0..1
+      const s = Math.min(Math.max((raw.speed - 0.2) / 2.8, 0.0), 1.0);    // 0..1
+      return {
+        density:      0.7 + c * 3.5,        // ~0.7 .. 4.2 across the slider
+        speed:        1.0 + s * 3.0,         // ~1.0 .. 4.0 -> their wind btn1..btn4
+        particleSize: raw.size,
+      };
+    },
+  },
+  fog: {
+    // DEFAULT = slow + thick roiling fog. Ranges give wiggle room both ways:
+    // higher count/speed reaches the native sand effect's dense/fast feel; small
+    // size produces thin wispy tendrils, large size broad soft banks.
+    //   count 20..400  -> density ~0.8..4.2  (default 120 -> ~1.9, several layers = thick)
+    //   speed 0.2..3.0 -> speed   ~0.7..3.6  (default 1.0 -> slow roil; max -> sand pace)
+    //   size  0.3..3.0 -> particleSize passthrough (small = tendrils, large = banks)
+    defaults: { count: 160, speed: 0.7, size: 1.4 },
+    map: (raw) => {
+      const c = Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0);
+      const s = Math.min(Math.max((raw.speed - 0.2) / 2.8, 0.0), 1.0);
+      return {
+        density:      0.8 + c * 3.4,        // ~0.8 .. 4.2
+        speed:        0.7 + s * 2.9,         // ~0.7 (near-still roil) .. 3.6 (sand pace)
+        particleSize: raw.size,
+      };
+    },
+  },
+  dust: {
+    // 110-mote pool (see SHADER_DUST). density (0..1) gates how many are visible.
+    // Slow ambient drift, so speed stays gentle (raw passthrough; shader scales low).
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    map: (raw) => {
+      const c = Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0);
+      const shaped = Math.pow(c, 0.75);
+      return {
+        speed:        raw.speed,
+        density:      0.04 + shaped * 0.96,
+        particleSize: raw.size,
+      };
+    },
+  },
+  bubbles: {
+    // 80-bubble pool (see SHADER_BUBBLES). density (0..1) gates visible count.
+    defaults: { count: 120, speed: 1.0, size: 1.0 },
+    map: (raw) => {
+      const c = Math.min(Math.max((raw.count - 20.0) / 380.0, 0.0), 1.0);
+      const shaped = Math.pow(c, 0.75);
+      return {
+        speed:        raw.speed,
+        density:      0.04 + shaped * 0.96,
+        particleSize: raw.size,
+      };
+    },
+  },
+};
+
+function calibrationFor(effect) {
+  return CALIBRATION[effect] || CALIBRATION.embers;
+}
+
 function buildUniforms(s) {
   const colors = (s.colors && s.colors.length) ? s.colors : ["#ff6a00", "#ff9f43", "#ffe066"];
   const c1 = hexToVec3(colors[0] || "#ff6a00");
@@ -394,14 +1247,31 @@ function buildUniforms(s) {
   // Direction: default upward (embers rise). direction is {x, y} in world space
   const dir = s.direction || { x: 0, y: -1 };
 
+  // Per-effect slider interpretation
+  const raw = {
+    count: s.count ?? 120,
+    speed: s.speed ?? 1.0,
+    size:  s.size  ?? 1.0,
+  };
+  const m = calibrationFor(s.effect).map(raw);
+
+  // Cloud alpha ceiling: keeps the map readable under full coverage. Sourced from
+  // the item's opacity so a GM can make storm cover thicker or wispier; clouds
+  // default lower than other effects because they fill large areas.
+  const cloudCap = (s.effect === "cloud")
+    ? (typeof s.opacity === "number" ? s.opacity : 0.55)
+    : 1.0;
+
   return [
-    { name: "speed",        value: s.speed        ?? 1.0 },
-    { name: "density",      value: (s.count / 120.0) * 3.0 },
-    { name: "particleSize", value: s.size         ?? 1.0 },
+    { name: "speed",        value: m.speed },
+    { name: "density",      value: m.density },
+    { name: "particleSize", value: m.particleSize },
     { name: "direction",    value: dir },
     { name: "color1",       value: c1 },
     { name: "color2",       value: c2 },
     { name: "color3",       value: c3 },
+    { name: "cloudCap",     value: cloudCap },
+    { name: "gridDpi",      value: gridDpi },
   ];
 }
 
@@ -476,7 +1346,42 @@ async function reconcileItems(items) {
 // ── OBR Init ──────────────────────────────────────────────────────────────────
 
 OBR.onReady(() => {
-  // Menu 1: Add — shown on maps WITHOUT our metadata
+  const SETTINGS_POPOVER_ID = `${PLUGIN_ID}/settings-popover`;
+
+  // Shared opener so BOTH the Add and Settings entries show the same panel. Anchored
+  // to the context-menu item element, placed to its RIGHT (anchor menu's right edge
+  // to the popover's left edge) so it sits BESIDE the menu rather than over it.
+  // The panel is DRAGGABLE, which requires a full-viewport transparent iframe (the
+  // "stage") so there's room to drag the panel anywhere. The stage passes pointer
+  // events through to the map everywhere EXCEPT on the panel itself (handled in
+  // menu.html via pointer-events), so the map stays interactive while the panel is
+  // open. Panel starts bottom-left. Position anchoring (not element) avoids the
+  // cold-open corner bug entirely.
+  async function openSettingsPopover() {
+    let vw = 1280, vh = 720;
+    try {
+      const w = await OBR.viewport.getWidth();
+      const h = await OBR.viewport.getHeight();
+      if (w) vw = w;
+      if (h) vh = h;
+    } catch (e) {}
+    await OBR.popover.open({
+      id: SETTINGS_POPOVER_ID,
+      url: "/menu.html",
+      width: vw,
+      height: vh,
+      anchorReference: "POSITION",
+      anchorPosition: { left: 0, top: 0 },
+      anchorOrigin:    { horizontal: "LEFT", vertical: "TOP" },
+      transformOrigin: { horizontal: "LEFT", vertical: "TOP" },
+      disableClickAway: true,
+      hidePaper: true,
+    });
+  }
+
+  // Menu 1: Add — shown on maps WITHOUT our metadata. Writes the default settings
+  // (embers on) AND opens the panel immediately, so the user doesn't have to click a
+  // second time to get the controls.
   OBR.contextMenu.create({
     id: `${PLUGIN_ID}/menu-add`,
     icons: [{
@@ -491,7 +1396,7 @@ OBR.onReady(() => {
         permissions: ["UPDATE"],
       },
     }],
-    async onClick(context) {
+    async onClick(context, elementId) {
       await OBR.scene.items.updateItems(context.items, (items) => {
         for (const item of items) {
           item.metadata[META_KEY] = {
@@ -501,15 +1406,19 @@ OBR.onReady(() => {
             speed:     1.0,
             size:      1.0,
             opacity:   0.85,
-            direction: { x: 0, y: 1 },
+            direction: { x: 1, y: -1 },
             colors:    ["#ff6a00", "#ff9f43", "#ffe066"],
           };
         }
       });
+      // Open the controls right away (menu.html reads the freshly written metadata).
+      await openSettingsPopover();
     },
   });
 
-  // Menu 2: Settings — shown on maps WITH our metadata, uses embed
+  // Menu 2: Settings — shown on maps WITH our metadata. Opens the same popover panel
+  // beside the context menu. menu.html targets the item via OBR.player.getSelection(),
+  // which the right-click already populated — so no extra context need be passed.
   OBR.contextMenu.create({
     id: `${PLUGIN_ID}/menu-settings`,
     icons: [{
@@ -524,15 +1433,16 @@ OBR.onReady(() => {
         permissions: ["UPDATE"],
       },
     }],
-    embed: {
-      url: "/menu.html",
-      height: 600,
+    async onClick(context, elementId) {
+      await openSettingsPopover();
     },
   });
 
   const handleSceneReady = async (ready) => {
     if (ready) {
       try {
+        // Cache the grid DPI so particle sizing is grid-relative (scale-independent).
+        try { gridDpi = await OBR.scene.grid.getDpi() || 150; } catch (e) { gridDpi = 150; }
         const items = await OBR.scene.items.getItems();
         await reconcileItems(items);
       } catch(e) {
@@ -542,6 +1452,16 @@ OBR.onReady(() => {
       activeEffects.clear();
     }
   };
+
+  // If the grid scale changes, refresh the cached DPI and rebuild effects so their
+  // particle sizes stay correct.
+  OBR.scene.grid.onChange(async (grid) => {
+    try {
+      gridDpi = (grid && grid.dpi) ? grid.dpi : (await OBR.scene.grid.getDpi() || 150);
+      const items = await OBR.scene.items.getItems();
+      await reconcileItems(items);
+    } catch (e) {}
+  });
 
   OBR.scene.items.onChange(reconcileItems);
   OBR.scene.onReadyChange(handleSceneReady);
