@@ -348,6 +348,8 @@
       direction: settings.direction ? { ...settings.direction } : undefined,
       colors:  [...customColors],
     };
+    // Persist the updated remembered block into item metadata (fire and forget).
+    saveSettings();
   }
 
   // Get remembered settings for an effect on the current map, or null if none.
@@ -631,6 +633,8 @@
       rememberEnabled = !rememberEnabled;
       if (rememberEnabled) rememberCurrent();
       remTrack.className = "toggle-track" + (rememberEnabled ? " on" : "");
+      // Persist the global toggle state to room metadata (set-and-forget).
+      try { OBR.room.setMetadata({ [`${PLUGIN_ID}/rememberEnabled`]: rememberEnabled }); } catch (e) {}
     };
     remRow.appendChild(remToggle);
     rightCol.appendChild(remRow);
@@ -741,10 +745,15 @@
   async function saveSettings() {
     if (!selectedItems.length) return;
     settings.colors = [...customColors];
+    const id = selectedItems[0] && selectedItems[0].id;
+    // The per-map remembered per-effect settings ride along inside the item's own
+    // metadata (under _remembered), so they persist across closing/reopening the
+    // menu, reloads, and logins — the metadata is saved with the scene.
+    const rememberedBlock = (id && rememberedSettings[id]) ? rememberedSettings[id] : {};
     try {
       await OBR.scene.items.updateItems(selectedItems, (items) => {
         for (const item of items) {
-          item.metadata[META_KEY] = { ...settings };
+          item.metadata[META_KEY] = { ...settings, _remembered: rememberedBlock };
         }
       });
     } catch (err) {
@@ -765,10 +774,22 @@
     const items = await OBR.scene.items.getItems(selection);
     selectedItems = items;
 
+    // Load the GLOBAL remember-toggle state from room metadata (set-and-forget across
+    // all maps). Stored separately from per-map settings.
+    try {
+      const room = await OBR.room.getMetadata();
+      const flag = room && room[`${PLUGIN_ID}/rememberEnabled`];
+      if (typeof flag === "boolean") rememberEnabled = flag;
+    } catch (e) {}
+
     // Read existing settings from the first item
     if (items.length > 0 && items[0].metadata && items[0].metadata[META_KEY]) {
       const stored = items[0].metadata[META_KEY];
-      settings     = { ...DEFAULTS, ...stored };
+      // Pull the remembered per-effect block out (if present) and rehydrate the store
+      // so persistence survives menu close / reload / login.
+      const { _remembered, ...activeStored } = stored;
+      if (_remembered && items[0].id) rememberedSettings[items[0].id] = _remembered;
+      settings     = { ...DEFAULTS, ...activeStored };
       customColors = settings.colors ? [...settings.colors] : [...DEFAULTS.colors];
       direction    = settings.direction || { x: 0, y: -1 };
     }
@@ -781,7 +802,9 @@
       if (updated.length > 0 && updated[0].metadata && updated[0].metadata[META_KEY]) {
         selectedItems = updated;
         const stored = updated[0].metadata[META_KEY];
-        settings     = { ...DEFAULTS, ...stored };
+        const { _remembered, ...activeStored } = stored;
+        if (_remembered && updated[0].id) rememberedSettings[updated[0].id] = _remembered;
+        settings     = { ...DEFAULTS, ...activeStored };
         customColors = settings.colors ? [...settings.colors] : [...DEFAULTS.colors];
         direction    = settings.direction || { x: 0, y: -1 };
         buildUI();
