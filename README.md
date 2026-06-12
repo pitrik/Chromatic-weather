@@ -25,6 +25,7 @@ All visuals are GPU shaders (SkSL) rendered directly in the scene, so effects ar
 - Per-effect colour presets plus up to three fully custom colours.
 - Live sliders for particle count, speed, and size.
 - A direction control for effects where travel direction is meaningful (automatically greyed out for effects that ignore it, such as Fireflies, Top Down Rain, and Dust).
+- Option to remember settings on a per map, and per effect basis
 - A draggable control panel that floats over the map so you can see your changes as you make them.
 - Grid-relative particle sizing, so particles stay a consistent real-world size regardless of how large the map is.
 
